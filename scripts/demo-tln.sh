@@ -3,8 +3,9 @@
 # TLN Hackathon（2026-09-19～20）展示腳本
 #
 # 主題：零信任 API 閘道 —— 每一次請求都重新驗證，攔截後留下可稽核的證據。
-# 說故事的順序刻意從「攻擊者視角」走到「防守者視角」：
-# 先讓四種攻擊在你眼前失敗，再讓一個合法請求通過，最後回頭看它留下的稽核軌跡。
+# Kind 展示環境關閉 mTLS（AEGIS_REQUIRE_MTLS=false，見 ADR 0003），
+# 因此本腳本把火力集中在「無效 JWT」與「演算法混淆」兩類可重現的驗證攻擊，
+# 並用旁白對照正式環境必須開啟的傳輸層身分。
 #
 # 對應 CCSP Domain 5（雲端安全維運）。主持稿見 docs/demo/tln.md。
 set -euo pipefail
@@ -29,18 +30,15 @@ demo::optional_cmd jq     "稽核日誌會以原始 JSON 單行呈現，較難�
 demo::require_cluster
 demo::require_deploy gateway
 demo::require_deploy dataplane
-demo::require_file "${AEGIS_DEMO_PKI_DIR}/ca.crt" \
-  "demo 用 PKI 尚未產生；見 docs/demo/README.md 的「demo 素材」一節"
 demo::require_file "${AEGIS_DEMO_TOKEN_DIR}/analyst.jwt" \
   "demo 用 JWT 尚未產生；見 docs/demo/README.md 的「demo 素材」一節"
+demo::require_file "${AEGIS_DEMO_TOKEN_DIR}/attack-alg-none.jwt" \
+  "缺少 alg=none 攻擊 token；見 docs/demo/README.md"
+demo::require_file "${AEGIS_DEMO_TOKEN_DIR}/attack-alg-hs256.jwt" \
+  "缺少 RS256→HS256 攻擊 token；見 docs/demo/README.md"
 
-CA="${AEGIS_DEMO_PKI_DIR}/ca.crt"
-CERT="${AEGIS_DEMO_PKI_DIR}/client-analyst.crt"
-KEY="${AEGIS_DEMO_PKI_DIR}/client-analyst.key"
 BASE="${AEGIS_DEMO_BASE_URL}"
 RECORDS="${BASE}/api/v1/vault/records"
-
-# curl 的共同參數：只印狀態碼，讓每一幕的判定一目瞭然。
 CODE_ONLY='-sS -o /dev/null -w %{http_code}'
 
 demo::pause
@@ -52,51 +50,58 @@ demo::scene "健康探針：唯一不需要驗證的路徑" \
   "先讓這一發成功，證明後面的失敗是被擋下來，不是服務掛了。"
 
 demo::port_forward "$AEGIS_NAMESPACE" "svc/gateway" "${AEGIS_GATEWAY_PORT}:${AEGIS_GATEWAY_PORT}"
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' '${BASE}/healthz'"
-demo::assert_http 200 "存活探針可在無憑證、無 token 的情況下回應"
+demo::run "curl ${CODE_ONLY} '${BASE}/healthz'"
+demo::assert_http 200 "存活探針可在無 token 的情況下回應"
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::scene "攻擊一：沒有用戶端憑證" \
-  "AEGIS_REQUIRE_MTLS=true 讓閘道在 TLS 交握階段就要求用戶端出示憑證。" \
-  "攻擊者連應用層都到不了 —— 連線在 TLS 層就斷掉，curl 會回非零結束碼。" \
-  "這一幕證明的是「傳輸層身分」，跟 token 無關；token 是下一層的事。"
+demo::scene "仲裁說明：Kind 展示關閉 mTLS，正式環境必須開啟" \
+  "infra/k8s/base/gateway.yaml 把 AEGIS_REQUIRE_MTLS 設為 false。" \
+  "Kind 叢集沒有 Ingress、沒有 cert-manager、沒有 service mesh，" \
+  "契約上的 8080 是明文 HTTP 埠；若在這裡強制用戶端憑證，所有展示流量都會在 TLS 交握失敗。" \
+  "關掉的只是傳輸層身分。JWT 驗簽、Rego 授權、限流仍然全程啟用。" \
+  "正式環境務必改回 true，由 Ingress 或 sidecar 轉發用戶端憑證。"
 
-demo::run "curl -sS --cacert '${CA}' '${RECORDS}/demo-0001'"
-demo::assert_fail "無用戶端憑證的請求在 TLS 交握階段就被拒絕"
-demo::run "curl -sS ${BASE//https/http}/api/v1/vault/records 2>&1 | head -3"
-demo::assert_fail "改用明文 HTTP 也連不進來：閘道只聽 TLS，沒有降級的空間"
+demo::run "kubectl -n ${AEGIS_NAMESPACE} get deploy/gateway -o jsonpath='{.spec.template.spec.containers[0].env}' \\
+  | tr ',' '\\n' | grep -E 'AEGIS_REQUIRE_MTLS|AEGIS_PSEUDONYM_SALT' || true"
+demo::assert_contains "AEGIS_REQUIRE_MTLS" "閘道部署列得出 mTLS 開關（Kind 值為 false）"
+
+demo::show "curl --cert client.crt --key client.key --cacert ca.crt https://gateway.example/api/v1/vault/records" \
+  "正式環境的呼叫型態：TLS 交握就先驗用戶端憑證，應用層才輪到 JWT"
+demo::narrate "" \
+  "決策紀錄：docs/adr/0003-kind-demo-mtls.md" \
+  "本場 TLN 能在評審筆電上重現的攻擊面，是無效 JWT 與演算法混淆，不是 mTLS 交握失敗。"
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::scene "攻擊二：有憑證，但 token 是偽造的" \
-  "通過 mTLS 只代表「你是叢集認識的用戶端」，不代表「你是誰、能做什麼」。" \
+demo::scene "攻擊一：token 是偽造的" \
+  "沒有 mTLS 並不代表「沒帶 token 也能進來」。" \
   "閘道用 AEGIS_JWKS_PATH 的公鑰驗簽，簽章不符一律 401。" \
   "同時觀察 aegis_authn_failures_total{reason=\"invalid_signature\"} 有沒有加一。"
 
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+demo::run "curl ${CODE_ONLY} \\
   -H 'Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhdHRhY2tlciJ9.bm90LWEtc2lnbmF0dXJl' \\
   '${RECORDS}/demo-0001'"
 demo::assert_http 401 "簽章無效的 JWT 被拒絕"
 
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' --cert '${CERT}' --key '${KEY}' '${RECORDS}/demo-0001'"
+demo::run "curl ${CODE_ONLY} '${RECORDS}/demo-0001'"
 demo::assert_http 401 "完全不帶 token 的請求被拒絕（reason=missing_token）"
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::scene "攻擊三：演算法混淆（algorithm confusion）" \
+demo::scene "攻擊二：演算法混淆（algorithm confusion）" \
   "這是 JWT 最經典的實作漏洞，也是最能看出實作者功力的一題。" \
   "手法一：把 header 改成 alg=none，賭驗證端「沒有簽章就不驗簽章」。" \
   "手法二：把 alg 從 RS256 改成 HS256，用 JWKS 裡的 RSA 公鑰當 HMAC 密鑰 ——" \
   "公鑰是公開的，若驗證端照 header 說的做，攻擊者就能自簽任意身分。" \
   "正確做法是把允許的演算法寫死在伺服器端，不信任 header 的 alg 欄位。"
 
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+demo::run "curl ${CODE_ONLY} \\
   -H \"Authorization: Bearer \$(cat '${AEGIS_DEMO_TOKEN_DIR}/attack-alg-none.jwt')\" \\
   '${RECORDS}/demo-0001'"
 demo::assert_http 401 "alg=none 的 token 被拒絕"
 
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+demo::run "curl ${CODE_ONLY} \\
   -H \"Authorization: Bearer \$(cat '${AEGIS_DEMO_TOKEN_DIR}/attack-alg-hs256.jwt')\" \\
   '${RECORDS}/demo-0001'"
 demo::assert_http 401 "RS256→HS256 混淆攻擊被拒絕（伺服器端寫死允許的演算法）"
@@ -106,12 +111,15 @@ demo::narrate "" "實作位置：services/gateway/internal/middleware/authn.go" 
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::scene "合法請求：三道門一次通過" \
-  "同一條 middleware 鏈，換成合法憑證與合法 token 就順利通行。" \
-  "順序是 mTLS → JWT/SBT 驗簽 → 授權決策 → 限流 → OTel 追蹤注入。" \
+demo::scene "合法請求：驗證通過，閘道產生假名 subject" \
+  "同一條 middleware 鏈，換成合法 token 就順利通行。" \
+  "順序是 JWT/SBT 驗簽 → 授權決策 → 限流 → OTel 追蹤注入。" \
+  "subject 不來自客戶端、也不由資料面重算：閘道用 AEGIS_PSEUDONYM_SALT" \
+  "對 JWT 的 sub 做 HMAC-SHA256，取前 16 碼十六進位，加上 sub_ 前綴，" \
+  "再以 X-Aegis-Subject 傳給 dataplane。日誌與指標只看得到這個假名。" \
   "X-Aegis-Request-ID 會被一路帶到 dataplane，稍後在日誌裡就靠它串起來。"
 
-demo::run "curl -sS --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+demo::run "curl -sS \\
   -H \"Authorization: Bearer \$(cat '${AEGIS_DEMO_TOKEN_DIR}/analyst.jwt')\" \\
   -H 'X-Aegis-Request-ID: demo-tln-001' \\
   -H 'Content-Type: application/json' \\
@@ -121,13 +129,13 @@ demo::assert_contains "HTTP 201" "合法請求成功建立加密紀錄"
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::scene "攻擊四：越權（有效身分，但超出授權範圍）" \
+demo::scene "攻擊三：越權（有效身分，但超出授權範圍）" \
   "這是零信任跟「有帳號就通行」最大的差別：驗證通過只是入場，不是通行證。" \
   "analyst 這個身分只能讀寫 vault 紀錄，不能觸發碳權退役 ——" \
   "授權決策由 Rego 政策做，回 403 並累加 aegis_authz_denied_total。" \
-  "注意這個指標的 subject 標籤是假名，不是原始使用者識別資料。"
+  "注意這個指標的 subject 標籤是閘道算出的假名，不是原始使用者識別資料。"
 
-demo::run "curl ${CODE_ONLY} --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+demo::run "curl ${CODE_ONLY} \\
   -H \"Authorization: Bearer \$(cat '${AEGIS_DEMO_TOKEN_DIR}/analyst.jwt')\" \\
   -H 'Content-Type: application/json' -d '{\"projectId\":1,\"amount\":10}' \\
   '${BASE}/api/v1/carbon/retire'"
@@ -154,12 +162,12 @@ demo::pause
 
 # ---------------------------------------------------------------------------
 demo::scene "限流：可用性也是安全屬性" \
-  "AEGIS_RATE_LIMIT_RPS=20、burst=40，以 subject 為單位而非以 IP 為單位 ——" \
+  "AEGIS_RATE_LIMIT_RPS=20、burst=40，以假名 subject 為單位而非以 IP 為單位 ——" \
   "因為在 NAT 或 service mesh 後面，IP 幾乎沒有識別意義。" \
   "連打 60 發，前 40 發吃掉 burst，之後開始出現 429。"
 
 demo::run "for i in \$(seq 1 60); do \\
-  curl -sS -o /dev/null -w '%{http_code}\\n' --cacert '${CA}' --cert '${CERT}' --key '${KEY}' \\
+  curl -sS -o /dev/null -w '%{http_code}\\n' \\
     -H \"Authorization: Bearer \$(cat '${AEGIS_DEMO_TOKEN_DIR}/analyst.jwt')\" \\
     '${RECORDS}/demo-0001'; \\
 done | sort | uniq -c"
@@ -168,8 +176,8 @@ demo::pause
 
 # ---------------------------------------------------------------------------
 demo::scene "稽核軌跡：攔截之後留下了什麼" \
-  "偵測不到的防禦等於沒有防禦。四種攻擊都在 stdout 留下結構化 JSON 事件。" \
-  "重點請看 subject 欄位：它是 sub_ 加上 HMAC-SHA256 前 16 碼，是假名。" \
+  "偵測不到的防禦等於沒有防禦。攻擊都在 stdout 留下結構化 JSON 事件。" \
+  "subject 由閘道的 AEGIS_PSEUDONYM_SALT 產生，經 X-Aegis-Subject 傳給資料面。" \
   "同一個人永遠對應同一個假名，所以事件仍可 join 分析；但無法反推原值。" \
   "日誌裡不會有原始 PII、金鑰材料，也不會有完整 JWT。"
 
@@ -186,7 +194,13 @@ demo::assert_contains 'sub_' "稽核事件的 subject 是假名而非真實身�
 demo::run "kubectl -n ${AEGIS_NAMESPACE} logs deploy/gateway --since=10m | grep -c 'A123456789' || true"
 demo::assert_absent 'A123456789' "剛才送進去的身分證號完全沒有出現在閘道日誌中"
 
-demo::narrate "" "假名化實作：services/dataplane/app/crypto/pseudonym.py（HMAC 金鑰來自 KMS）" \
+demo::run "kubectl -n ${AEGIS_NAMESPACE} logs deploy/dataplane --since=10m \\
+  | grep -E 'X-Aegis-Subject|\"subject\":\"sub_' | tail -4 || true"
+demo::assert_contains 'sub_' "資料面日誌的 subject 來自閘道轉發的 X-Aegis-Subject"
+
+demo::narrate "" \
+  "假名化實作：services/gateway（HMAC 金鑰來自 AEGIS_PSEUDONYM_SALT）" \
+  "傳遞標頭：X-Aegis-Subject；決策紀錄：docs/adr/0004-gateway-pseudonym-subject.md" \
   "日誌欄位契約：docs/CONTRACT.md 第 4 節。"
 demo::pause
 
@@ -204,18 +218,19 @@ demo::show "kubectl -n ${AEGIS_OBS_NAMESPACE} port-forward svc/kube-prometheus-s
   "現場改用另一個終端機開著，方便切到瀏覽器"
 demo::narrate "" \
   "瀏覽器打開 http://localhost:3000 → Dashboards → Aegis Zero-Trust SIEM。" \
+  "預設帳密見 docs/demo/README.md（只適用本機 Kind，正式環境不可沿用）。" \
   "要指給評審看的三個面板：" \
-  "  1. 驗證失敗依 reason 分佈 —— 剛才四種攻擊各自對應哪一根柱子" \
+  "  1. 驗證失敗依 reason 分佈 —— 剛才偽造 JWT 與 alg confusion 各自對應哪一根柱子" \
   "  2. 授權拒絕熱點依假名 subject 排名 —— 誰在試探不屬於他的資源" \
   "  3. 觸發中的告警 —— 例如 15 分鐘內驗證失敗暴增" \
   "告警規則：infra/observability/prometheus/rules/，儀表板 JSON 在同目錄的 grafana/。"
 demo::pause
 
 # ---------------------------------------------------------------------------
-demo::rubric "零信任架構落實|不是「有 API key 就算零信任」：mTLS（傳輸層身分）、JWT/SBT 驗簽（主體身分）、Rego 授權（最小權限）、限流（額度）四層獨立驗證，加上 Cilium L7 作為網路層的第二道鎖。第 2 到 7 幕各自打掉其中一層的假設。"
-demo::rubric "威脅建模|docs/threat-model.md 用 STRIDE 逐一分析每條資料流，每個威脅都連到具體緩解措施與程式碼位置。這支腳本的每一幕都是威脅模型裡某一列的可執行證明。"
-demo::rubric "自動化威脅攔截|攔截由 middleware 與 CiliumNetworkPolicy 在請求路徑上同步完成，不是事後掃描。第 8 幕的 429 與第 7 幕的 403 都是即時判定。"
-demo::rubric "日誌審計與 SIEM|結構化 JSON 稽核事件（契約第 4 節）→ Prometheus 指標（契約第 3 節）→ Grafana 告警。subject 一律假名化，這是把「可稽核」與「個資最小化」同時做到的關鍵。"
+demo::rubric "零信任架構落實|Kind 展示關閉 mTLS 是為了能在筆電上重現，不是省略傳輸層身分。正式環境開 mTLS；本場以 JWT 驗簽、演算法混淆防護、Rego 授權、限流與 Cilium L7 證明「每一層獨立驗證」。"
+demo::rubric "威脅建模|docs/threat-model.md 用 STRIDE 逐一分析每條資料流。第 3、4 幕對應偽造憑證與演算法混淆；第 6 幕對應權限提升；第 7 幕對應橫向移動。"
+demo::rubric "自動化威脅攔截|攔截由 middleware 與 CiliumNetworkPolicy 在請求路徑上同步完成，不是事後掃描。第 8 幕的 429 與第 6 幕的 403 都是即時判定。"
+demo::rubric "日誌審計與 SIEM|結構化 JSON 稽核事件（契約第 4 節）→ Prometheus 指標（契約第 3 節）→ Grafana 告警。subject 由閘道 AEGIS_PSEUDONYM_SALT 產生並經 X-Aegis-Subject 傳遞。"
 demo::rubric "CCSP Domain 5 對照|事件偵測與回應、日誌留存與完整性、安全維運指標。逐項對照見 docs/ccsp-mapping.md。"
 
 demo::summary

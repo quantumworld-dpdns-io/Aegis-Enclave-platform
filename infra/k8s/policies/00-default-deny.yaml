@@ -1,0 +1,20 @@
+# 預設全拒絕 —— 微分段的地基
+#
+# 防的是：任何「忘記寫 allow 規則」就自動放行的隱性信任。
+# Cilium 對被此政策選中的 endpoint 啟用 ingress + egress 預設拒絕；
+# 沒有出現在後續 01–05 白名單上的連線，會在 eBPF 被丟棄並進入 Hubble DROPPED。
+# 這是 HackTitan demo 的前提：攻擊者直連 dataplane 不是「沒人理」，而是「策略主動拒絕」。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-default-deny
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: default-deny
+spec:
+  description: "aegis namespace 內所有工作負載預設拒絕進出流量"
+  endpointSelector: {}
+  enableDefaultDeny:
+    ingress: true
+    egress: true

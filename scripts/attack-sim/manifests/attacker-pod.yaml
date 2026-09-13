@@ -1,0 +1,55 @@
+# 攻擊模擬：從 attacker namespace 直連 dataplane。
+# 預期被 00-default-deny + 06-attacker-isolation 在 L3/L4 丟棄。
+# PSA 只到 baseline，但仍 drop ALL / 非 root，避免「為了攻擊就開特權」。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-sim-attacker
+  namespace: attacker
+  labels:
+    app.kubernetes.io/name: attack-sim
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/role: attacker
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    runAsGroup: 100
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 100
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Mi

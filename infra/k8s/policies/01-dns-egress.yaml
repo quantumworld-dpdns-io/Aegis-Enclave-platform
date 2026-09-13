@@ -1,0 +1,35 @@
+# DNS 出向 —— 只准解析叢集內網域
+#
+# 防的是：被攻陷的 Pod 用 DNS 當 C2 通道，或解析外部主機後把資料外帶。
+# L7 DNS 規則把可解析名稱鎖在 *.cluster.local；example.com 這類外部查詢
+# 會被 Envoy 丟棄。這也是 attack-sim 情境四（egress 擋）的第一道鎖，
+# 第二道鎖是 04-dataplane-egress 只放行三個後端埠。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-dns-egress
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: dns-egress
+spec:
+  description: "允許 aegis 工作負載向 kube-dns 查詢叢集內網域"
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              # 只允許解析叢集內名稱。dataplane / gateway / localstack / vault / anvil
+              # 的 Service FQDN 都落在這個 pattern 底下。
+              - matchPattern: "*.cluster.local"
+              - matchPattern: "*.svc.cluster.local"
+              - matchName: kubernetes.default.svc.cluster.local

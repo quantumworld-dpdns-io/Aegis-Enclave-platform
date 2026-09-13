@@ -1,0 +1,134 @@
+# Foundry Anvil 本地鏈 —— dataplane 呼叫碳權合約的 JSON-RPC 後端
+#
+# chainId 31337 對齊契約第 7 節與 contracts/deployments/local.json。
+# 不持久化鏈狀態：Pod 重啟後帳本清空，必須重新跑 forge script 部署並
+# patch ConfigMap aegis-chain。這是本機 demo 可接受的取捨。
+#
+# 正式環境不會跑 Anvil；應改連測試網 / 主網 RPC，並由模組 A 寫入真實合約位址。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anvil-sa
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: anvil
+    app.kubernetes.io/part-of: aegis-enclave
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: anvil
+    app.kubernetes.io/component: chain
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anvil
+    app.kubernetes.io/component: chain
+  ports:
+    - name: rpc
+      port: 8545
+      targetPort: rpc
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: anvil
+    app.kubernetes.io/component: chain
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvil
+      app.kubernetes.io/component: chain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvil
+        app.kubernetes.io/component: chain
+        app.kubernetes.io/part-of: aegis-enclave
+    spec:
+      serviceAccountName: anvil-sa
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: anvil
+          image: ghcr.io/foundry-rs/foundry:v1.2.3
+          imagePullPolicy: IfNotPresent
+          command:
+            - anvil
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8545"
+            - --chain-id
+            - "31337"
+          ports:
+            - name: rpc
+              containerPort: 8545
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: TMPDIR
+              value: "/tmp"
+          # Anvil 沒有 HTTP 健康路徑，用 TCP 探針確認 JSON-RPC 埠已在聽。
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

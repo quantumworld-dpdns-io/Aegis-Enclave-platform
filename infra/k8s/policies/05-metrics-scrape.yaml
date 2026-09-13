@@ -1,0 +1,60 @@
+# Prometheus 抓取 —— SIEM 不能是空的
+#
+# 防的是兩種相反的失敗：
+#   1. 完全不放行 /metrics → 模組 F 的告警與儀表板沒資料，微分段「看起來」很乾淨。
+#   2. 把指標埠對全世界開放 → 未授權者讀到限流、授權拒絕等敏感計數。
+#
+# 仲裁硬性要求：observability namespace 的 Prometheus 必須能
+#   GET /metrics → dataplane:8000 與 GET /metrics → gateway:9090。
+# L7 把方法鎖在 GET、路徑鎖在 /metrics，避免有人拿 scrape 身分打業務 API。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-metrics-scrape-gateway
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: metrics-scrape
+spec:
+  description: "允許 observability Prometheus GET gateway:9090/metrics"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "9090"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: "/metrics"
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-metrics-scrape-dataplane
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: metrics-scrape
+spec:
+  description: "允許 observability Prometheus GET dataplane:8000/metrics"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: dataplane
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: "/metrics"

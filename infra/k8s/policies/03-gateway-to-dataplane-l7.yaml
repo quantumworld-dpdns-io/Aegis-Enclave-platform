@@ -1,0 +1,78 @@
+# 閘道 → 資料面 L7 —— 微分段 demo 的主角
+#
+# 防的是兩件事：
+#   1. 不是 gateway 的 Pod（含 attacker）直連 dataplane —— L3/L4 直接丟棄。
+#   2. 就算來源是 gateway，也只能打契約第 2 節列出的 method + path。
+#      /internal/v1/keys、/docs、/openapi.json 會被 Envoy 回 403。
+#
+# 路徑刻意逐條列出，不用 /internal/v1/* 萬用字元：
+# 否則 /internal/v1/keys 會被放行，attack-sim 情境二就證偽不了。
+# 同時寫 gateway 的 egress，否則 00-default-deny 會把合法下行也擋掉。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-gateway-to-dataplane-l7
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: gateway-to-dataplane-l7
+spec:
+  description: "只允許 gateway 以契約路徑呼叫 dataplane:8000"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: dataplane
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: gateway
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: "/internal/healthz"
+              - method: POST
+                path: "/internal/v1/records"
+              - method: GET
+                path: "/internal/v1/records/.*"
+              - method: POST
+                path: "/internal/v1/chain/retire"
+    # kubelet 存活/就緒探針走 /internal/healthz（契約第 2 節唯一的免驗證內部路徑）。
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: "/internal/healthz"
+---
+# gateway 側的對應出向：沒有這條，00-default-deny 會讓閘道連不出去。
+# 選擇器只看 app.kubernetes.io/name=gateway，攻擊模擬的探針 Pod
+# （不帶 component=server）會拿到同一個 Cilium 身分，才能用閘道身分打 L7。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-gateway-egress-dataplane
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: gateway-egress-dataplane
+spec:
+  description: "允許 gateway 出向連到 dataplane:8000"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: dataplane
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP

@@ -137,6 +137,17 @@ spec:
               value: ""
             - name: AEGIS_LOG_LEVEL
               value: "info"
+            # 仲裁：gateway 用此 salt 對 JWT `sub` 做 HMAC-SHA256，
+            # 日誌與指標的 subject 寫成 `sub_` + hex[:16]。
+            # 契約第 5 節尚未列入此變數（由協調者仲裁新增）；正式補約前以此為準。
+            # 值來自 Secret，絕不可寫死在清單裡。optional 是為了平行開發：
+            # Secret 尚未套用時 Pod 仍排得起來，不會卡住整個部署。
+            - name: AEGIS_PSEUDONYM_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-gateway-secrets
+                  key: pseudonym-salt
+                  optional: true
           # 探針路徑取自 CONTRACT.md 第 2 節，兩者都不需要通過身分驗證，
           # 因此即使 mTLS/JWT 全開，kubelet 仍探得到。
           livenessProbe:

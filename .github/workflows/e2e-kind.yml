@@ -1,0 +1,207 @@
+# ==============================================================================
+# 守護對象：整座本機叢集的「微分段真的有效」
+#
+# 這條 workflow 是跨模組的最後一道閘門，負責證明：
+#   1. Kind 叢集能用契約指定的 node image（kindest/node:v1.31.0）拉起來
+#   2. Cilium 1.20.1 能在關閉預設 CNI、關閉 KPR 的組態下就緒
+#   3. 應用映像能載入叢集，且 `scripts/attack-sim/run.sh` 證實越權連線被擋
+#
+# 失敗時收集節點 / Pod / Cilium / 應用日誌，方便不在 runner 上的人排查。
+# 對應 CCSP Domain 3（平台安全）與 Domain 5（營運 / 驗證控制項有效）。
+# ==============================================================================
+name: e2e-kind
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/gateway/**'
+      - 'services/dataplane/**'
+      - 'infra/k8s/**'
+      - 'infra/terraform/**'
+      - 'scripts/attack-sim/**'
+      - '.github/workflows/e2e-kind.yml'
+      - '.github/kind/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/gateway/**'
+      - 'services/dataplane/**'
+      - 'infra/k8s/**'
+      - 'infra/terraform/**'
+      - 'scripts/attack-sim/**'
+      - '.github/workflows/e2e-kind.yml'
+      - '.github/kind/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CLUSTER_NAME: aegis-enclave
+  CILIUM_VERSION: '1.20.1'
+  CILIUM_CLI_VERSION: v0.18.8
+  GATEWAY_IMAGE: aegis/gateway:dev
+  DATAPLANE_IMAGE: aegis/dataplane:dev
+  HELM_VERSION: v3.17.3
+
+jobs:
+  e2e:
+    name: Kind + Cilium + attack-sim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      - name: 安裝 Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # wait 必須是 0s：disableDefaultCNI 時節點會一直 NotReady，等到 Cilium 裝上才會轉 Ready。
+      - name: 建立 Kind 叢集
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.31.0
+          kubectl_version: v1.31.0
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          config: .github/kind/cluster.yaml
+          node_image: kindest/node:v1.31.0
+          wait: 0s
+
+      - name: 安裝 Cilium CLI
+        env:
+          CILIUM_CLI_VERSION: ${{ env.CILIUM_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --remote-name-all \
+            "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz"{,.sha256sum}
+          sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
+          sudo tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
+          rm -f cilium-linux-amd64.tar.gz cilium-linux-amd64.tar.gz.sha256sum
+          cilium version --client
+
+      - name: 預先載入 Cilium 映像
+        run: |
+          set -euo pipefail
+          docker pull "quay.io/cilium/cilium:v${CILIUM_VERSION}"
+          docker pull "quay.io/cilium/operator-generic:v${CILIUM_VERSION}"
+          docker pull "quay.io/cilium/hubble-relay:v${CILIUM_VERSION}"
+          kind load docker-image "quay.io/cilium/cilium:v${CILIUM_VERSION}" --name "${CLUSTER_NAME}"
+          kind load docker-image "quay.io/cilium/operator-generic:v${CILIUM_VERSION}" --name "${CLUSTER_NAME}"
+          kind load docker-image "quay.io/cilium/hubble-relay:v${CILIUM_VERSION}" --name "${CLUSTER_NAME}"
+
+      - name: 安裝 Cilium 1.20.1（含 Hubble Relay）
+        run: |
+          set -euo pipefail
+          helm repo add cilium https://helm.cilium.io/
+          helm repo update cilium
+          helm upgrade --install cilium cilium/cilium \
+            --version "${CILIUM_VERSION}" \
+            --namespace kube-system \
+            --set image.pullPolicy=IfNotPresent \
+            --set ipam.mode=kubernetes \
+            --set kubeProxyReplacement=false \
+            --set operator.replicas=1 \
+            --set hubble.enabled=true \
+            --set hubble.relay.enabled=true \
+            --set hubble.ui.enabled=false \
+            --wait \
+            --timeout 5m
+          cilium status --wait --wait-duration 5m
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
+      - name: 確認 Cilium 版本為 1.20.1
+        run: |
+          set -euo pipefail
+          image="$(kubectl -n kube-system get ds cilium \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "cilium-agent image=${image}"
+          case "${image}" in
+            *":v${CILIUM_VERSION}"*|*":${CILIUM_VERSION}"*)
+              echo "Cilium 版本符合契約 ${CILIUM_VERSION}"
+              ;;
+            *)
+              echo "::error::Cilium 映像不是 v${CILIUM_VERSION}：${image}"
+              exit 1
+              ;;
+          esac
+
+      - name: 建置並載入應用映像
+        run: |
+          set -euo pipefail
+          docker build -t "${GATEWAY_IMAGE}" services/gateway
+          docker build -t "${DATAPLANE_IMAGE}" services/dataplane
+          kind load docker-image "${GATEWAY_IMAGE}" --name "${CLUSTER_NAME}"
+          kind load docker-image "${DATAPLANE_IMAGE}" --name "${CLUSTER_NAME}"
+
+      - name: 部署應用與網路策略
+        run: |
+          set -euo pipefail
+          kubectl apply -k infra/k8s/base
+          kubectl apply -f infra/k8s/policies/
+          kubectl -n aegis rollout status deploy/gateway --timeout=180s
+          kubectl -n aegis rollout status deploy/dataplane --timeout=180s
+
+      - name: 執行攻擊模擬（scripts/attack-sim/run.sh）
+        run: |
+          set -euo pipefail
+          chmod +x scripts/attack-sim/run.sh
+          ./scripts/attack-sim/run.sh
+
+      - name: 收集叢集診斷
+        if: failure()
+        run: |
+          set +e
+          dest="${RUNNER_TEMP}/kind-diagnostics"
+          mkdir -p "${dest}"
+
+          {
+            echo "===== cluster-info ====="
+            kubectl cluster-info
+            echo
+            echo "===== nodes ====="
+            kubectl get nodes -o wide
+            echo
+            echo "===== pods ====="
+            kubectl get pods -A -o wide
+            echo
+            echo "===== helm ====="
+            helm list -A
+            echo
+            echo "===== cilium status ====="
+            cilium status
+            echo
+            echo "===== ciliumnetworkpolicies ====="
+            kubectl get ciliumnetworkpolicy -A -o wide
+            kubectl get ciliumclusterwidenetworkpolicy -A -o wide
+          } > "${dest}/summary.txt" 2>&1
+
+          kubectl get events -A --sort-by='.lastTimestamp' > "${dest}/events.txt" 2>&1
+          kubectl -n kube-system logs -l k8s-app=cilium --tail=400 --prefix > "${dest}/cilium-agent.log" 2>&1
+          kubectl -n kube-system logs -l io.cilium/app=operator --tail=200 --prefix > "${dest}/cilium-operator.log" 2>&1
+          kubectl -n kube-system logs -l k8s-app=hubble-relay --tail=200 --prefix > "${dest}/hubble-relay.log" 2>&1
+          kubectl -n aegis describe pods > "${dest}/aegis-describe.txt" 2>&1
+          kubectl -n aegis logs --all-containers --prefix --tail=300 --selector app.kubernetes.io/part-of=aegis-enclave \
+            > "${dest}/aegis-logs.txt" 2>&1
+          kubectl -n attacker describe pods > "${dest}/attacker-describe.txt" 2>&1
+          kubectl -n attacker logs --all-containers --prefix --tail=200 --selector app.kubernetes.io/part-of=aegis-enclave \
+            > "${dest}/attacker-logs.txt" 2>&1
+          kubectl get ciliumnetworkpolicy -A -o yaml > "${dest}/ciliumnetworkpolicy.yaml" 2>&1
+          echo "診斷已寫入 ${dest}"
+
+      - name: 上傳診斷 artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-kind-diagnostics
+          path: ${{ runner.temp }}/kind-diagnostics
+          if-no-files-found: warn
+          retention-days: 7

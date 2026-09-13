@@ -1,0 +1,86 @@
+# 資料面出向 —— 只准打三個後端
+#
+# 防的是：dataplane 被 RCE 之後把明文或 DEK 外帶到網際網路。
+# 契約第 5 節只承認三個下游：localstack:4566、vault:8200、anvil:8545。
+# 對 example.com:443 的連線會被 00 + 本檔擋下，這是 attack-sim 情境四。
+#
+# 後端本身也在 aegis namespace，受 00-default-deny 約束，
+# 所以同一檔補上它們的 ingress，否則 dataplane 合法呼叫也會被丟棄。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-dataplane-egress
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: dataplane-egress
+spec:
+  description: "dataplane 只能出向到 localstack / vault / anvil"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: dataplane
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: localstack
+      toPorts:
+        - ports:
+            - port: "4566"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: vault
+      toPorts:
+        - ports:
+            - port: "8200"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: anvil
+      toPorts:
+        - ports:
+            - port: "8545"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-kms-chain-ingress
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: kms-chain-ingress
+spec:
+  description: "localstack / vault / anvil 只接受來自 dataplane 的進向"
+  endpointSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - localstack
+          - vault
+          - anvil
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: dataplane
+      toPorts:
+        - ports:
+            - port: "4566"
+              protocol: TCP
+            - port: "8200"
+              protocol: TCP
+            - port: "8545"
+              protocol: TCP
+    # kubelet 探針（localstack/vault 的 HTTP、anvil 的 TCP）。
+    - fromEntities:
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "4566"
+              protocol: TCP
+            - port: "8200"
+              protocol: TCP
+            - port: "8545"
+              protocol: TCP

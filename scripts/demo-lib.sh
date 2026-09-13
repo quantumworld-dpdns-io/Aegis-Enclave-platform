@@ -66,8 +66,11 @@ AEGIS_ATTACKER_NAMESPACE="${AEGIS_ATTACKER_NAMESPACE:-attacker}"
 AEGIS_CLUSTER_NAME="${AEGIS_CLUSTER_NAME:-aegis-enclave}"
 AEGIS_GATEWAY_PORT="${AEGIS_GATEWAY_PORT:-8080}"
 AEGIS_GATEWAY_METRICS_PORT="${AEGIS_GATEWAY_METRICS_PORT:-9090}"
-AEGIS_DEMO_BASE_URL="${AEGIS_DEMO_BASE_URL:-https://127.0.0.1:${AEGIS_GATEWAY_PORT}}"
-# demo 用的用戶端憑證與 JWT。實際產生者見 docs/demo/README.md 的「demo 素材」一節。
+# Kind 展示沒有 Ingress / cert-manager，閘道 8080 是明文 HTTP，
+# 且 AEGIS_REQUIRE_MTLS=false（見 docs/adr/0003-kind-demo-mtls.md）。
+# 正式環境改走 https:// 並強制用戶端憑證。
+AEGIS_DEMO_BASE_URL="${AEGIS_DEMO_BASE_URL:-http://127.0.0.1:${AEGIS_GATEWAY_PORT}}"
+# demo 用的 JWT（以及正式環境才需要的用戶端憑證）。產生方式見 docs/demo/README.md。
 # 預設刻意用相對路徑：所有 demo 腳本開場都會 cd 到 repo 根目錄，
 # 這樣印在螢幕上的指令是短的、可以直接複製貼上的，不會被一長串絕對路徑淹沒。
 AEGIS_DEMO_ASSET_DIR="${AEGIS_DEMO_ASSET_DIR:-.demo}"
@@ -105,9 +108,9 @@ demo::usage() {
   --max-lines N   每個指令最多顯示 N 行輸出（預設 ${DEMO_MAX_LINES}）。
   -h, --help      顯示這段說明。
 
-環境變數（預設值對齊 docs/CONTRACT.md）：
+環境變數（預設值對齊 docs/CONTRACT.md；Kind 展示的例外見 docs/adr/0003）：
   AEGIS_NAMESPACE          應用命名空間（預設 aegis）
-  AEGIS_DEMO_BASE_URL      閘道對外位址（預設 https://127.0.0.1:8080）
+  AEGIS_DEMO_BASE_URL      閘道對外位址（Kind 預設 http://127.0.0.1:8080）
   AEGIS_DEMO_ASSET_DIR     demo 用 PKI 與 JWT 的存放目錄（預設 <repo>/.demo）
   NO_COLOR                 設任何值即停用顏色
 EOF

@@ -1,0 +1,194 @@
+# LocalStack KMS —— dataplane 預設 KeyProvider 後端
+#
+# 本機 demo 用它取代 AWS KMS，讓信封加密與假名化金鑰完全離線可跑。
+# 只開 KMS 服務（SERVICES=kms），縮小攻擊面：不啟動 S3/IAM/Lambda 等用不到的 API。
+# init 腳本在 LocalStack ready 之後建立契約要求的兩把 alias：
+#   alias/aegis-master     — 包裝 DEK 的主金鑰
+#   alias/aegis-pseudonym  — PII tokenization 用的 HMAC 金鑰（與 subject 假名分開）
+#
+# 正式環境請切 AEGIS_KMS_DRIVER=aws 或 vault，並刪掉這個 Deployment。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localstack-sa
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/part-of: aegis-enclave
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: localstack-init
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/part-of: aegis-enclave
+data:
+  # LocalStack 會在服務就緒後執行 /etc/localstack/init/ready.d/ 底下的腳本。
+  10-create-kms-keys.sh: |
+    #!/bin/bash
+    # 建立（或重用）契約第 5 節要求的兩把 KMS alias。
+    # 冪等：重複啟動不會因為 alias 已存在而失敗。
+    set -euo pipefail
+    create_alias() {
+      alias_name="$1"
+      desc="$2"
+      existing="$(awslocal kms list-aliases --query "Aliases[?AliasName=='${alias_name}'].AliasName" --output text 2>/dev/null || true)"
+      if [ -n "${existing}" ] && [ "${existing}" != "None" ]; then
+        echo "KMS alias ${alias_name} 已存在，略過建立"
+        return 0
+      fi
+      key_id="$(awslocal kms create-key --description "${desc}" --query KeyMetadata.KeyId --output text)"
+      awslocal kms create-alias --alias-name "${alias_name}" --target-key-id "${key_id}"
+      echo "已建立 KMS alias ${alias_name} -> ${key_id}"
+    }
+    create_alias "alias/aegis-master" "Aegis-Enclave envelope KEK (demo)"
+    create_alias "alias/aegis-pseudonym" "Aegis-Enclave PII tokenization HMAC key (demo)"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localstack
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/component: kms
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/component: kms
+  ports:
+    - name: edge
+      port: 4566
+      targetPort: edge
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localstack
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: localstack
+    app.kubernetes.io/component: kms
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: localstack
+      app.kubernetes.io/component: kms
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: localstack
+        app.kubernetes.io/component: kms
+        app.kubernetes.io/part-of: aegis-enclave
+    spec:
+      serviceAccountName: localstack-sa
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: localstack
+          image: localstack/localstack:4.6.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: edge
+              containerPort: 4566
+              protocol: TCP
+          env:
+            # 只開 KMS，避免把整個 AWS 模擬面暴露在叢集內。
+            - name: SERVICES
+              value: "kms"
+            - name: AWS_DEFAULT_REGION
+              value: "ap-northeast-1"
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            - name: LOCALSTACK_USER
+              value: "localstack"
+            - name: SKIP_SSL_CERT_DOWNLOAD
+              value: "1"
+            - name: DISABLE_EVENTS
+              value: "1"
+            - name: EAGER_SERVICE_LOADING
+              value: "1"
+            - name: HOME
+              value: "/tmp"
+            - name: TMPDIR
+              value: "/tmp"
+          livenessProbe:
+            httpGet:
+              path: /_localstack/health
+              port: edge
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /_localstack/health
+              port: edge
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/localstack
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run
+            - name: init
+              mountPath: /etc/localstack/init/ready.d
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: init
+          configMap:
+            name: localstack-init
+            defaultMode: 0755

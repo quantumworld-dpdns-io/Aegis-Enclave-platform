@@ -64,6 +64,14 @@ shrink_run_limit = 10_000
 optimizer = false
 via_ir = false
 
+# --- Lint：build 時關閉，避免測試檔的風格 warning 被 deny_warnings 當成編譯失敗 ---
+# src 可用 `forge lint src` 單獨檢查；ignore 只對 `forge lint` 生效。
+[lint]
+lint_on_build = false
+ignore = ["test/**", "script/**", "lib/**"]
+# 公開 immutable 用 camelCase getter（registry()），不符 SCREAMING_SNAKE 風格但較符合介面習慣
+exclude_lints = ["screaming-snake-case-immutable"]
+
 [fmt]
 line_length = 120
 tab_width = 4

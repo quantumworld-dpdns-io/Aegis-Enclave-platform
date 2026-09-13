@@ -1,0 +1,53 @@
+# 攻擊者隔離 —— 第二道防線
+#
+# 防的是：00-default-deny 被誤刪或放寬之後，attacker namespace 仍能摸到 aegis。
+# ingressDeny 優先於任何 allow 規則，即使有人後來對 dataplane 加了「允許 cluster」
+# 這類過寬規則，來自 attacker 的封包仍會被丟棄。
+#
+# attacker 自己也預設拒絕，只放行 DNS（必須解析得到 dataplane FQDN，
+# 攻擊才能走到 TCP 層被 Hubble 記成 DROPPED，而不是卡在「找不到主機」）。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-deny-attacker-ingress
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: deny-attacker
+spec:
+  description: "明確拒絕來自 attacker namespace 的任何進向"
+  endpointSelector: {}
+  ingressDeny:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: attacker
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: attacker-default-deny
+  namespace: attacker
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: attacker-isolation
+spec:
+  description: "attacker namespace 預設拒絕；只准查 DNS 以便發動可觀測的攻擊"
+  endpointSelector: {}
+  enableDefaultDeny:
+    ingress: true
+    egress: true
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchPattern: "*.cluster.local"
+              - matchPattern: "*.svc.cluster.local"

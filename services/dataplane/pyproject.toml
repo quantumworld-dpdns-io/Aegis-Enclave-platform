@@ -3,9 +3,8 @@ name = "aegis-dataplane"
 version = "0.1.0"
 description = "Aegis-Enclave 模組 C：資料安全服務（信封加密、PII 動態遮罩、碳權鏈上互動）"
 readme = "README.md"
-# 容器內固定 3.12（CONTRACT.md 第 1 節）；上限鎖到 3.13 之前，避免本機用 3.14
-# 跑出與正式環境不同的位元組碼與相依解析結果。
-requires-python = ">=3.12,<3.13"
+# 容器內固定 3.12（CONTRACT.md 第 1 節）。本機允許 3.14，因此不設 <3.13 上限。
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -56,6 +55,21 @@ ignore = [
     "ISC001",
     # Any 在少數與外部 SDK 交界處無法避免，改由 mypy 控管
     "ANN401",
+    # 註解與說明必須用繁中，全形標點是正常用字而非混淆字元
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 錯誤 code 是穩定識別字，訊息本身已先賦值給變數
+    "EM101",
+    "EM102",
+    # Protocol / 執行期需要的 import 不能只留在 TYPE_CHECKING
+    "TC001",
+    "TC002",
+    "TC003",
+    # web3 / boto3 延遲載入是為了啟動時 graceful degrade
+    "PLC0415",
+    # 把 SDK 例外轉成 DataplaneError 必須在 try 內 raise
+    "TRY301",
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -101,7 +115,11 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --strict-markers --strict-config"
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # starlette.testclient 尚未切到 httpx2，import 時會警告；不影響正式路徑。
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["app"]

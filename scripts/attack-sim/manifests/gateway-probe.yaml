@@ -1,0 +1,56 @@
+# 帶 gateway 標籤、不帶 component=server 的探針。
+# Cilium 身分跟真的閘道相同，因此 L7 規則會套上來；
+# Service selector 多了 component=server，這個 Pod 不會進 endpoints。
+# 用來從「合法來源」打 /internal/v1/keys（預期 403）與 /internal/healthz（預期 200）。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attack-sim-gateway-probe
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/role: probe
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    runAsGroup: 100
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 100
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Mi

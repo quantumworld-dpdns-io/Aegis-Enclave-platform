@@ -1,0 +1,30 @@
+# 閘道進向 —— 唯一對外入口
+#
+# 防的是：攻擊者略過閘道、或把探針打到不該曝光的埠（例如 9090 指標）。
+# 業務埠 8080 接受來自叢集外、節點（kubelet 探針 / port-forward）與叢集內的流量；
+# 指標埠刻意不在這裡放行，只由 05-metrics-scrape 對 observability 開放。
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: aegis-gateway-ingress
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/policy: gateway-ingress
+spec:
+  description: "只放行進入 gateway:8080 的業務流量與 kubelet 探針"
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  ingress:
+    # 對外、in-cluster、以及節點網路（kubelet 探針 / kubectl port-forward）。
+    # 刻意不加 L7：一旦 8080 被 Envoy 接管，只放行 /healthz 會把業務 API 一起擋掉。
+    - fromEntities:
+        - world
+        - cluster
+        - host
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP

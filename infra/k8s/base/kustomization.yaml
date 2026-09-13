@@ -1,0 +1,18 @@
+# Kustomize 進入點。Makefile 的 `deploy` 目標會執行
+# `kubectl apply -k infra/k8s/base`，因此本檔是應用工作負載的唯一清單。
+#
+# 刻意不設 `namespace:` 欄位：namespace.yaml 同時建立 aegis 與 attacker，
+# 若在這裡寫 namespace: aegis，Kustomize 會把 attacker Namespace 物件
+# 強制改名到 aegis，信任邊界就塌了。
+# 仲裁：aegis / attacker 由本模組擁有，Terraform 不會建立這兩個 namespace。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - secrets.example.yaml
+  - gateway.yaml
+  - dataplane.yaml
+  - localstack.yaml
+  - vault.yaml
+  - anvil.yaml

@@ -1,0 +1,165 @@
+# HashiCorp Vault（dev 模式）—— dataplane 的 Transit KeyProvider 後端
+#
+# ⚠️ 這是展示用的單節點 dev server：記憶體儲存、自動解封、root token 已知。
+# 正式環境必須改成 HA + 自動解封（auto-unseal）+ 禁止 root token，
+# 並由 Vault Agent Injector 把短效 token 掛進 dataplane。
+#
+# postStart 啟用 Transit Engine 並建立契約要求的 `aegis-master` 金鑰。
+# drop ALL + 無 IPC_LOCK：dev 模式本來就不做 mlock，SKIP_SETCAP 避免啟動時嘗試提權。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-sa
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/part-of: aegis-enclave
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/component: kms
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/component: kms
+  ports:
+    - name: http
+      port: 8200
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/component: kms
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vault
+      app.kubernetes.io/component: kms
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vault
+        app.kubernetes.io/component: kms
+        app.kubernetes.io/part-of: aegis-enclave
+    spec:
+      serviceAccountName: vault-sa
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vault
+          image: hashicorp/vault:1.19.5
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - -dev
+            - -dev-listen-address=0.0.0.0:8200
+          ports:
+            - name: http
+              containerPort: 8200
+              protocol: TCP
+          env:
+            - name: VAULT_DEV_ROOT_TOKEN_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-dataplane-secrets
+                  key: vault-token
+            - name: VAULT_ADDR
+              value: "http://127.0.0.1:8200"
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-dataplane-secrets
+                  key: vault-token
+            # 沒有 CAP_IPC_LOCK / CAP_SETUID，必須略過 setcap，否則啟動直接失敗。
+            - name: SKIP_SETCAP
+              value: "true"
+            - name: HOME
+              value: "/tmp"
+            - name: TMPDIR
+              value: "/tmp"
+          # 等 Vault 聽得到之後再啟用 Transit，避免 dataplane 第一次切 vault driver 時找不到金鑰。
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    i=0
+                    while [ "$i" -lt 30 ]; do
+                      if vault status >/dev/null 2>&1; then
+                        break
+                      fi
+                      i=$((i + 1))
+                      sleep 1
+                    done
+                    vault secrets enable transit >/dev/null 2>&1 || true
+                    vault write -f transit/keys/aegis-master >/dev/null 2>&1 || true
+          livenessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi

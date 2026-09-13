@@ -1,0 +1,150 @@
+# ==============================================================================
+# 守護對象：`infra/terraform/`、`infra/k8s/`（模組 D / E 的基礎設施即程式碼）
+#
+# 這條 workflow 是「基礎設施安全」賽道（HackTitan）的品質閘門，負責證明：
+#   1. Terraform 程式碼格式一致且可通過靜態驗證（fmt + init + validate）
+#   2. Terraform 與 Kubernetes 清單沒有 HIGH/CRITICAL 錯誤組態（Trivy config）
+#   3. 掃描結果進入 GitHub Code Scanning（SARIF），留下可稽核軌跡
+#
+# 刻意不做 terraform apply：建立 Kind 叢集是 e2e-kind 的職責。
+# 本檔只回答「這份 IaC 寫得對不對、安不安全」，對應 CCSP Domain 3。
+# ==============================================================================
+name: iac
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+      - 'infra/k8s/**'
+      - 'infra/observability/**'
+      - '.github/workflows/iac.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+      - 'infra/k8s/**'
+      - 'infra/observability/**'
+      - '.github/workflows/iac.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 對齊 versions.tf 的 required_version >= 1.9；釘住 patch 以免 CI 結果飄移。
+  TF_VERSION: '1.11.4'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+  # 關閉 HashiCorp Checkpoint，避免 CI 對外部版本檢查服務產生無謂相依。
+  CHECKPOINT_DISABLE: '1'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Terraform 格式與靜態驗證
+  # ---------------------------------------------------------------------------
+  terraform-validate:
+    name: fmt / init / validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # hashicorp/setup-terraform v4.0.1。關閉 wrapper，讓後續步驟拿到真正的
+      # terraform 二進位與原始結束碼，避免 wrapper 改寫輸出讓腳本誤判。
+      - name: 安裝 Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: 檢查格式（terraform fmt -check -recursive）
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive -no-color
+
+      # -backend=false：CI 只做靜態驗證，不連遠端 state，也不寫本機 backend。
+      - name: 初始化（terraform init -backend=false）
+        working-directory: infra/terraform
+        run: terraform init -backend=false -input=false -no-color
+
+      - name: 靜態驗證（terraform validate）
+        working-directory: infra/terraform
+        run: terraform validate -no-color
+
+  # ---------------------------------------------------------------------------
+  # Trivy config：錯誤組態掃描（阻擋 + SARIF）
+  # ---------------------------------------------------------------------------
+  trivy-config:
+    name: Trivy config（Terraform / Kubernetes）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # 唯一提權原因：上傳 Trivy 的 SARIF 報告到 Code Scanning。
+      security-events: write
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # 與 Makefile `scan-iac` 相同範圍：terraform + k8s。
+      # 先產出 SARIF（exit-code 0）確保 upload-sarif 一定跑得到。
+      - name: Trivy 掃描 Terraform（產出 SARIF）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          format: sarif
+          output: trivy-terraform.sarif
+          severity: 'HIGH,CRITICAL'
+          limit-severities-for-sarif: true
+          exit-code: '0'
+
+      - name: 上傳 Terraform SARIF 到 Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-terraform.sarif
+          category: trivy-config-terraform
+
+      - name: Trivy 掃描 Kubernetes 清單（產出 SARIF）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/k8s
+          format: sarif
+          output: trivy-k8s.sarif
+          severity: 'HIGH,CRITICAL'
+          limit-severities-for-sarif: true
+          exit-code: '0'
+
+      - name: 上傳 Kubernetes SARIF 到 Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-k8s.sarif
+          category: trivy-config-k8s
+
+      # 真正的阻擋閘門，判準與 Makefile `scan-iac` 一致。
+      - name: Trivy 阻擋閘門：Terraform（HIGH/CRITICAL 即失敗）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          format: table
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+
+      - name: Trivy 阻擋閘門：Kubernetes（HIGH/CRITICAL 即失敗）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/k8s
+          format: table
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
