@@ -1,0 +1,94 @@
+# Aegis-Enclave 根目錄 build context 排除清單
+#
+# 適用範圍：只有以 repo 根目錄為 build context 的建置（例如 CI 的 buildx、
+# 未來的 compose 檔）才會套用本檔。Makefile 的 `make images` 是以
+# services/gateway 與 services/dataplane 為 context，那兩個目錄各自的
+# .dockerignore 由模組 B / C 維護 —— 這是 Docker 的既有行為，不是遺漏。
+#
+# 排除的兩個理由：
+#   1. 安全 —— 機密與狀態檔一旦進入 build context 就會留在映像層裡，
+#      即使 Dockerfile 沒有 COPY 它，`docker history` 與快取層仍可能洩漏。
+#   2. 速度 —— context 越小，建置與 `kind load` 越快，離線 demo 才來得及。
+
+# --- 機密與憑證：最高優先，絕對不可進入映像 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+.aws/
+.ssh/
+kubeconfig
+kubeconfig-*
+
+# --- 版控與 CI 元資料 ---
+.git/
+.gitignore
+.gitattributes
+.github/
+.cursor/
+
+# --- Terraform：tfstate 內含明文輸出，屬於機密等級 ---
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+override.tf
+override.tf.json
+crash.log
+infra/terraform/kubeconfig
+
+# --- Node / JS ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- Go ---
+services/gateway/bin/
+*.test
+*.out
+
+# --- Solidity / Foundry：out 與 cache 是可重現的建置產物 ---
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+lcov.info
+
+# --- 掃描報告與測試產出 ---
+reports/
+*.sarif
+trivy-results.*
+
+# --- 文件與展示素材：不影響執行期，但會拖慢 context 傳輸 ---
+docs/
+README.md
+*.md
+!services/**/README.md
+
+# --- 編輯器與作業系統 ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
