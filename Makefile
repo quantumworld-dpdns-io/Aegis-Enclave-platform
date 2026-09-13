@@ -44,6 +44,7 @@ doctor: ## 檢查本機環境是否具備執行條件
 .PHONY: up
 up: images ## 一鍵拉起 Kind 叢集 + Cilium + 可觀測性 + 應用程式
 	cd $(TF_DIR) && terraform init -upgrade && terraform apply -auto-approve
+	$(MAKE) load-kind
 	$(MAKE) deploy
 
 .PHONY: down
@@ -58,14 +59,17 @@ deploy: ## 部署應用程式與 Cilium 網路策略到既有叢集
 	kubectl -n aegis rollout status deploy/dataplane --timeout=180s
 
 .PHONY: images
-images: ## 建置容器映像並載入 Kind
+images: ## 建置容器映像
 	docker build -t $(GATEWAY_IMAGE) $(GATEWAY_DIR)
 	docker build -t $(DATAPLANE_IMAGE) $(DATAPLANE_DIR)
 
-.PHONY: load
-load: images ## 將映像載入既有的 Kind 叢集
+.PHONY: load-kind
+load-kind: ## 將已建好的映像載入既有 Kind 叢集（不重建）
 	kind load docker-image $(GATEWAY_IMAGE) --name $(CLUSTER_NAME)
 	kind load docker-image $(DATAPLANE_IMAGE) --name $(CLUSTER_NAME)
+
+.PHONY: load
+load: images load-kind ## 建置映像並載入既有的 Kind 叢集
 
 ##@ 測試
 
