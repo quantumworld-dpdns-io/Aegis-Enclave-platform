@@ -1,0 +1,170 @@
+# ==============================================================================
+# 守護對象：`services/gateway/`（模組 B，Go + Gin 零信任閘道）
+#
+# 這條 workflow 是「零信任閘道」賽道（TLN）的品質閘門，負責證明：
+#   1. 靜態檢查通過（go vet + golangci-lint）
+#   2. 單元測試在 race detector 下通過，並量測覆蓋率
+#   3. 供應鏈弱點已掃描（govulncheck 比對 Go 官方弱點資料庫）
+#   4. 容器映像本身沒有 HIGH/CRITICAL 弱點（Trivy，exit-code 1 直接阻擋）
+#   5. 掃描結果進入 GitHub Code Scanning（SARIF），留下可稽核軌跡
+#
+# 對應 CCSP Domain 4（應用程式安全）與 Domain 5（營運 / 弱點管理）：
+# 供應鏈弱點掃描與映像掃描是 CCSP 的直接考點，也是 SSDLC 的必要控制。
+# ==============================================================================
+name: gateway-go
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/gateway/**'
+      - '.github/workflows/gateway-go.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/gateway/**'
+      - '.github/workflows/gateway-go.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 依 docs/CONTRACT.md 第 1 節固定 Go 版本，避免各環境行為不一致。
+  GO_VERSION: '1.23'
+  GATEWAY_DIR: services/gateway
+  # 與 Makefile 的 GATEWAY_IMAGE 預設值一致（docs/CONTRACT.md 第 2 節）。
+  GATEWAY_IMAGE: aegis/gateway:dev
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 靜態檢查 + 測試 + 供應鏈弱點掃描
+  # ---------------------------------------------------------------------------
+  lint-test:
+    name: vet / lint / test / govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # actions/setup-go v7 內建 Go module 與 build cache；
+      # cache-dependency-path 指向 gateway 的 go.sum，讓快取鍵隨依賴變動而失效。
+      - name: 安裝 Go 工具鏈（含 module 快取）
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/gateway/go.sum
+
+      - name: 下載依賴
+        working-directory: services/gateway
+        run: go mod download
+
+      # go mod verify 會比對 module 內容與 go.sum 的雜湊，屬於基本的供應鏈完整性檢查。
+      - name: 驗證依賴完整性（go mod verify）
+        working-directory: services/gateway
+        run: go mod verify
+
+      - name: go vet
+        working-directory: services/gateway
+        run: go vet ./...
+
+      # golangci/golangci-lint-action v9 對應 golangci-lint v2.x；
+      # version 明確釘住 v2.13.2，避免 linter 新增規則時 CI 無預警轉紅。
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.13.2
+          working-directory: services/gateway
+          # action 自帶 lint 結果快取，這裡沿用預設設定即可。
+          args: --timeout=5m
+
+      # 等價於 Makefile 的 test-gateway（go test ./... -race -cover），
+      # 額外加上 -coverprofile 以便產出可上傳的覆蓋率檔案。
+      # -race 對零信任閘道特別重要：限流器與 policy 快取都有並行存取。
+      - name: 執行測試（-race + coverprofile）
+        working-directory: services/gateway
+        run: go test ./... -race -covermode=atomic -coverprofile=coverage.out
+
+      - name: 顯示覆蓋率摘要
+        working-directory: services/gateway
+        run: go tool cover -func=coverage.out | tail -n 1
+
+      - name: 上傳覆蓋率 artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateway-coverage
+          path: services/gateway/coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      # govulncheck 比對 Go 官方弱點資料庫（vuln.go.dev），且只回報「實際被呼叫到」
+      # 的弱點路徑，誤報率遠低於單純的版本比對。釘住 v1.8.0 讓結果可重現。
+      - name: 安裝 govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+      - name: 供應鏈弱點掃描（govulncheck）
+        working-directory: services/gateway
+        run: govulncheck ./...
+
+  # ---------------------------------------------------------------------------
+  # 容器映像建置 + Trivy 掃描（阻擋 + SARIF）
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: 建置映像 + Trivy 掃描
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      # 唯一提權原因：上傳 Trivy 的 SARIF 報告到 Code Scanning。
+      security-events: write
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # 與 Makefile `images` 目標的 gateway 部分等價（同一個映像標籤）。
+      # 這裡只建 gateway 不建 dataplane，因為本 workflow 的路徑過濾只涵蓋 gateway。
+      # 刻意不使用 buildx / multi-arch：CI 與 Kind 都只需要 linux/amd64，避免過度設計。
+      - name: 建置 gateway 容器映像
+        run: docker build -t "${GATEWAY_IMAGE}" "${GATEWAY_DIR}"
+
+      # aquasecurity/trivy-action v0.36.0。這一步只負責產出 SARIF，
+      # exit-code 固定為 0，確保後面的 upload-sarif 一定跑得到；
+      # limit-severities-for-sarif 讓 SARIF 內容與 severity 過濾條件一致。
+      - name: Trivy 掃描映像（產出 SARIF）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.GATEWAY_IMAGE }}
+          format: sarif
+          output: trivy-gateway.sarif
+          severity: 'HIGH,CRITICAL'
+          limit-severities-for-sarif: true
+          # 上游尚無修補的弱點無法靠我們解決，忽略以免閘門變成噪音。
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: 上傳 Trivy SARIF 到 Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-gateway.sarif
+          category: trivy-image-gateway
+
+      # 真正的阻擋閘門：與 Makefile `scan-images` 相同的判準
+      # （severity HIGH,CRITICAL + ignore-unfixed + exit-code 1）。
+      - name: Trivy 阻擋閘門（HIGH/CRITICAL 即失敗）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.GATEWAY_IMAGE }}
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'

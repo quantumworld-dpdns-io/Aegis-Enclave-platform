@@ -1,0 +1,272 @@
+# ==============================================================================
+# 守護對象：`contracts/` 底下的 Solidity 智能合約（模組 A）
+#
+# 這條 workflow 是「碳權合約」賽道（IEEE ClimateChain）的品質閘門，負責證明：
+#   1. 程式碼格式與可編譯性（forge fmt / forge build）
+#   2. 單元、fuzz、invariant 測試全數通過（forge test）
+#   3. 覆蓋率有被量測並留存為 artifact（forge coverage）
+#   4. 靜態安全分析結果進入 GitHub Code Scanning（Slither → SARIF）
+#   5. 對外 ABI 仍符合 docs/CONTRACT.md 第 7 節的介面契約
+#
+# 對應 CCSP Domain 4（應用程式安全 / SSDLC）：安全左移，合約在合併前就被審計。
+# ==============================================================================
+name: contracts
+
+on:
+  push:
+    branches: [main]
+    # monorepo 路徑過濾：只有合約本身或這條 workflow 變動才跑，避免無謂的 runner 消耗。
+    paths:
+      - 'contracts/**'
+      - '.github/workflows/contracts.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'contracts/**'
+      - '.github/workflows/contracts.yml'
+
+# 同一分支上的新 push 會取消仍在跑的舊執行，節省額度也讓回饋更快。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 工作流程層級採最小權限；只有需要上傳 SARIF 的 job 才會額外提權。
+permissions:
+  contents: read
+
+env:
+  # 依 docs/CONTRACT.md 第 1 節，Solidity 版本固定 0.8.28。
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 格式、編譯、測試、覆蓋率
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: fmt / build / test / coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v7 為目前主線版本；固定大版本標籤以取得安全修補又不破相容。
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+        with:
+          # Foundry 依賴常以 git submodule 管理，這裡需要完整的 submodule 還原能力。
+          submodules: recursive
+
+      # foundry-rs/foundry-toolchain 是 Foundry 官方 action；v1.9.1 為目前最新 patch，
+      # 固定 patch 版本可避免上游變更 forge 預設行為時 CI 突然改變結果。
+      - name: 安裝 Foundry 工具鏈
+        uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          # 使用 stable 通道而非 nightly，確保 forge coverage / forge inspect 行為穩定。
+          version: stable
+          # 快取 ~/.foundry（含 solc 二進位）以縮短後續執行時間。
+          cache: true
+
+      # contracts/lib 被 .gitignore 排除，因此 CI 必須自行還原合約依賴。
+      # 這份快取以 foundry.toml / soldeer.lock / .gitmodules 為鍵，內容變動才重新安裝。
+      - name: 還原合約依賴快取
+        uses: actions/cache@v6
+        with:
+          path: |
+            contracts/lib
+            contracts/dependencies
+          key: >-
+            foundry-deps-${{ runner.os }}-${{ hashFiles('contracts/foundry.toml',
+            'contracts/soldeer.lock', 'contracts/remappings.txt', '.gitmodules') }}
+          restore-keys: |
+            foundry-deps-${{ runner.os }}-
+
+      - name: 安裝合約依賴
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          # 兩種依賴管理方式都要支援：
+          #   - soldeer：foundry.toml 內有 [dependencies] 區段或存在 soldeer.lock
+          #   - git submodule：forge install 的傳統機制（依 .gitmodules 還原到 lib/）
+          if [ -f soldeer.lock ] || grep -qE '^[[:space:]]*\[dependencies\]' foundry.toml; then
+            echo "偵測到 soldeer 依賴設定，使用 forge soldeer install"
+            forge soldeer install
+          else
+            echo "使用 forge install（依 .gitmodules 還原 submodule）"
+            forge install
+          fi
+
+      - name: 檢查程式碼格式（forge fmt --check）
+        working-directory: contracts
+        run: forge fmt --check
+
+      # --sizes 會印出每個合約的 bytecode 大小，可及早發現逼近 EIP-170 24KB 上限的合約。
+      - name: 編譯合約並檢視大小（forge build --sizes）
+        working-directory: contracts
+        run: forge build --sizes
+
+      # 使用 foundry.toml 的 [profile.ci]（由 FOUNDRY_PROFILE 環境變數指定），
+      # 該 profile 通常會調高 fuzz runs 與 invariant depth，讓 CI 比本機更嚴格。
+      - name: 執行測試（forge test -vvv，profile=ci）
+        working-directory: contracts
+        run: forge test -vvv
+
+      # 直接呼叫根目錄 Makefile 的 coverage-contracts 目標，確保本機與 CI 行為完全一致。
+      - name: 產出覆蓋率報告（make coverage-contracts）
+        run: make coverage-contracts
+
+      - name: 上傳覆蓋率 artifact
+        # 即使前面步驟失敗也盡量保留已產生的報告，方便排查。
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: contracts-coverage-lcov
+          path: |
+            contracts/lcov.info
+          # 覆蓋率報告只是排查輔助，缺檔不應讓整條流程失敗。
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Slither 靜態安全分析 → GitHub Code Scanning
+  # ---------------------------------------------------------------------------
+  slither:
+    name: Slither 靜態分析（SARIF）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # 上傳 SARIF 到 Code Scanning 必須有這個權限，這也是本 job 唯一的提權原因。
+      security-events: write
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: 安裝 Foundry 工具鏈
+        uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          version: stable
+          cache: true
+
+      - name: 安裝合約依賴
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          # Slither 需要能完整編譯合約，因此這個 job 也得自行還原 contracts/lib。
+          if [ -f soldeer.lock ] || grep -qE '^[[:space:]]*\[dependencies\]' foundry.toml; then
+            forge soldeer install
+          else
+            forge install
+          fi
+
+      # crytic/slither-action 是 Slither 官方 action，v0.4.2 為目前最新版本。
+      # 重點：fail-on 設為 none，讓這一步一定成功、後面的 upload-sarif 一定跑得到；
+      #       真正的阻擋門檻交給 GitHub code scanning 的 alert 規則去設定
+      #       （Settings → Code security → Code scanning → Protection rules）。
+      - name: 執行 Slither 並產出 SARIF
+        id: slither
+        uses: crytic/slither-action@v0.4.2
+        with:
+          target: 'contracts/'
+          sarif: results.sarif
+          fail-on: none
+          # 不指定 slither-config，讓 action 使用 target 底下的 ./slither.config.json
+          # （即 contracts/slither.config.json，與 Makefile 的 scan-contracts 目標一致）。
+
+      - name: 上傳 SARIF 到 Code Scanning
+        # if: always() 確保即使 Slither 本身異常中斷，已產生的部分結果仍會上傳。
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+          category: slither-contracts
+
+  # ---------------------------------------------------------------------------
+  # 介面契約守門：確認 ABI 仍符合 docs/CONTRACT.md 第 7 節
+  # ---------------------------------------------------------------------------
+  abi-contract-guard:
+    name: ABI 介面契約檢查（CONTRACT.md 第 7 節）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: 安裝 Foundry 工具鏈
+        uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          version: stable
+          cache: true
+
+      - name: 安裝合約依賴
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          if [ -f soldeer.lock ] || grep -qE '^[[:space:]]*\[dependencies\]' foundry.toml; then
+            forge soldeer install
+          else
+            forge install
+          fi
+
+      - name: 編譯合約
+        working-directory: contracts
+        run: forge build
+
+      # 這一步是跨模組協作的保險：dataplane（模組 C）以 web3 依賴這些函式與事件簽章對帳，
+      # 一旦合約作者改了參數型別或事件欄位，這裡會先擋下來，而不是等到 e2e 才爆。
+      - name: 驗證對外函式與事件簽章
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+
+          # 由 ABI JSON 組出標準化簽章字串，例如 mintBatch(address,uint256,uint256,bytes32)
+          signatures() {
+            local contract="$1" kind="$2"
+            forge inspect "${contract}" abi --json \
+              | jq -r --arg kind "${kind}" \
+                  '.[] | select(.type == $kind)
+                       | "\(.name)(\([.inputs[].type] | join(",")))"'
+          }
+
+          failed=0
+
+          # 斷言某個簽章存在於指定合約的 ABI 中。
+          assert_sig() {
+            local contract="$1" kind="$2" sig="$3"
+            if signatures "${contract}" "${kind}" | grep -Fxq "${sig}"; then
+              echo "  ✅ ${contract}.${sig}"
+            else
+              echo "  ❌ 缺少 ${kind}：${contract}.${sig}"
+              failed=1
+            fi
+          }
+
+          echo "檢查 CarbonCredit 對外函式…"
+          assert_sig CarbonCredit function 'mintBatch(address,uint256,uint256,bytes32)'
+          assert_sig CarbonCredit function 'retire(uint256,uint256,string)'
+          assert_sig CarbonCredit function 'totalRetired(uint256)'
+
+          echo "檢查 CarbonCredit 事件（dataplane 以此對帳）…"
+          assert_sig CarbonCredit event 'CreditsMinted(uint256,address,uint256,bytes32)'
+          assert_sig CarbonCredit event 'CreditsRetired(uint256,address,uint256,string)'
+
+          # RetirementRegistry 在 CONTRACT.md 中僅約定「必須存在且可編譯」，
+          # 尚未凍結細部簽章；因此這裡只驗證它有可解析的 ABI。
+          echo "檢查 RetirementRegistry 是否存在可解析的 ABI…"
+          if forge inspect RetirementRegistry abi --json | jq -e 'type == "array"' > /dev/null; then
+            echo "  ✅ RetirementRegistry ABI 可解析"
+          else
+            echo "  ❌ RetirementRegistry 缺少可解析的 ABI"
+            failed=1
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::合約 ABI 與 docs/CONTRACT.md 第 7 節不符，請同步契約或修正合約。"
+            exit 1
+          fi
+          echo "所有介面契約檢查通過。"

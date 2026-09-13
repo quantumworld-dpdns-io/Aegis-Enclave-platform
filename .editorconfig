@@ -1,8 +1,9 @@
-# Aegis-Enclave 跨語言縮排與換行規範
+# Aegis-Enclave 跨語言縮排慣例
 #
-# 這份設定的存在理由是：本 repo 同時有 Go、Python、Solidity、HCL、YAML 五種語言，
-# 各自的官方格式化工具（gofmt / ruff / forge fmt / terraform fmt）對縮排的主張不同。
-# 若不在編輯器層先對齊，PR 就會充滿與邏輯無關的空白差異，掩蓋真正需要審查的變更。
+# 本檔的存在理由：monorepo 同時含 Go / Python / Solidity / Terraform / YAML / Shell，
+# 六種語言的社群慣例互不相同。若只靠各語言的 formatter（gofmt、ruff、forge fmt、
+# terraform fmt），編輯器在 formatter 尚未執行前就會先插入錯誤的縮排，
+# 造成 diff 噪音。EditorConfig 讓編輯器在「打字的當下」就對齊各語言慣例。
 
 root = true
 
@@ -14,70 +15,65 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 2
 
-# --- Go ---
-# gofmt 強制使用 tab，且不接受任何設定覆寫，因此編輯器必須讓步。
+# Go 使用 tab 是 gofmt 的硬性規定，不可改為空白。
 [*.go]
 indent_style = tab
 indent_size = 4
 
-[go.mod]
+# go.mod / go.sum 由 go 工具鏈產生，同樣使用 tab。
+[{go.mod,go.sum}]
 indent_style = tab
+indent_size = 4
 
-[go.sum]
-indent_style = tab
-
-# --- Python ---
-# 對齊 PEP 8 與 ruff 的預設值。
+# PEP 8：4 空白。ruff format 的預設行寬為 88。
 [*.py]
 indent_style = space
 indent_size = 4
-max_line_length = 100
+max_line_length = 88
 
-[*.{pyi,toml}]
-indent_style = space
-indent_size = 4
-
-# --- Solidity ---
-# 對齊 Solidity 官方 style guide 與 forge fmt 的預設值。
+# Solidity 官方 style guide 與 forge fmt 預設為 4 空白。
 [*.sol]
 indent_style = space
 indent_size = 4
-max_line_length = 120
 
-# --- 組態檔（YAML / JSON / HCL）---
-# Kubernetes manifest、GitHub Actions、Terraform 生態一律 2 空格。
-[*.{yaml,yml,json,jsonc,hcl,tf,tfvars}]
+# HashiCorp 慣例：terraform fmt 輸出 2 空白。
+[*.{tf,tfvars,hcl}]
 indent_style = space
 indent_size = 2
 
-# --- Shell ---
-# 對齊 bootstrap.sh / doctor.sh / demo-*.sh 既有的 2 空格風格。
-[*.sh]
+# YAML 不允許 tab 作為縮排字元（規格層級的限制）。
+[*.{yaml,yml}]
 indent_style = space
 indent_size = 2
 
-# --- Makefile ---
-# recipe 行必須以實體 tab 開頭，否則 make 會直接報 "missing separator"。
-[Makefile]
-indent_style = tab
-
-[{Makefile,*.mk}]
-indent_style = tab
-
-# --- Markdown ---
-# 不修剪行尾空白：Markdown 用兩個空格表示強制換行，修掉會改變渲染結果。
-[*.md]
-trim_trailing_whitespace = false
+[*.{json,jsonc}]
+indent_style = space
 indent_size = 2
 
-# --- 產出物與第三方程式碼 ---
-# lockfile 與 vendored 相依由工具生成，不應被編輯器規則改動。
-[{*.lock,uv.lock,go.sum,lcov.info}]
-insert_final_newline = false
+# Google Shell Style Guide：2 空白，且 shell 對 tab 敏感度低但可讀性差。
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
+
+# Markdown 行尾雙空白是「換行」語法，因此不可裁切行尾空白。
+[*.{md,mdx}]
+indent_style = space
+indent_size = 2
 trim_trailing_whitespace = false
 
-[contracts/lib/**]
+# Makefile 的規則行必須以 tab 開頭，否則 make 直接報錯。
+[{Makefile,makefile,*.mk}]
+indent_style = tab
+indent_size = 4
+
+# Dockerfile
+[{Dockerfile,Dockerfile.*,*.dockerfile}]
+indent_style = space
+indent_size = 4
+
+# 產生物與 vendored 相依不套用本專案慣例。
+[{contracts/lib/**,**/*.lock,uv.lock,lcov.info}]
 indent_style = unset
 indent_size = unset
-trim_trailing_whitespace = false
-insert_final_newline = false
+trim_trailing_whitespace = unset
+insert_final_newline = unset

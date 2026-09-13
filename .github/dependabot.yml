@@ -1,0 +1,143 @@
+# Aegis-Enclave 相依更新策略
+#
+# 六個 ecosystem 全部週更。頻率選「週」而非「日」的理由是：這是黑客松 monorepo，
+# 每日 PR 會把有限的審查頻寬吃光，反而讓真正的安全更新被埋在雜訊裡。
+# 注意 Dependabot 的 security update 不受 schedule 限制，高風險漏洞仍會即時開 PR。
+#
+# 各 ecosystem 的更新時間刻意錯開，避免同一時刻湧入六批 PR 而觸發 CI 排隊。
+
+version: 2
+
+updates:
+  # --- 模組 B：Go 閘道 ---
+  # Go 的相依直接構成 TLS 與 JWT 驗證路徑，安全性更新優先度最高。
+  - package-ecosystem: gomod
+    directory: /services/gateway
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - "模組B-gateway"
+    commit-message:
+      prefix: "chore(gateway)"
+    groups:
+      # patch 版本合併成一個 PR，把審查頻寬留給 minor/major。
+      go-patch:
+        applies-to: version-updates
+        update-types:
+          - patch
+
+  # --- 模組 C：Python 資料面 ---
+  # 由 uv 管理，Dependabot 讀 pyproject.toml 與 uv.lock。
+  - package-ecosystem: pip
+    directory: /services/dataplane
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - "模組C-dataplane"
+    commit-message:
+      prefix: "chore(dataplane)"
+    groups:
+      python-patch:
+        applies-to: version-updates
+        update-types:
+          - patch
+
+  # --- 容器基底映像 ---
+  # 兩個服務分開列，因為 Dockerfile 的基底映像不同（Go distroless / Python slim），
+  # 混在一起會讓 PR 難以判斷該找哪個模組的 owner 審查。
+  - package-ecosystem: docker
+    directory: /services/gateway
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "09:00"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+      - "模組B-gateway"
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/dataplane
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "09:30"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+      - "模組C-dataplane"
+    commit-message:
+      prefix: "chore(docker)"
+
+  # --- 模組 D：Terraform ---
+  # provider 版本升級可能改變叢集行為，因此不做 grouping，逐一審查。
+  - package-ecosystem: terraform
+    directory: /infra/terraform
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "09:00"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - infrastructure
+      - "模組D-terraform"
+    commit-message:
+      prefix: "chore(terraform)"
+
+  # --- CI workflow 的 action 版本 ---
+  # 第三方 action 是供應鏈攻擊的常見入口（可讀取 GITHUB_TOKEN），
+  # 因此即使沒有功能需求也要保持在最新版並優先審查。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "09:30"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+      - security
+    commit-message:
+      prefix: "chore(ci)"
+
+  # --- JavaScript / TypeScript 工具鏈 ---
+  # 目前 repo 根目錄尚無 package.json，此項為預留：一旦加入前端展示介面或
+  # 文件站台的 npm 工具，這條設定就會自動生效，不必再回來補。
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: thursday
+      time: "09:00"
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - javascript
+    commit-message:
+      prefix: "chore(npm)"
+    groups:
+      npm-patch:
+        applies-to: version-updates
+        update-types:
+          - patch

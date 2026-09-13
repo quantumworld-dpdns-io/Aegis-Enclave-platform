@@ -1,0 +1,43 @@
+# 命名空間定義
+#
+# 這裡建立的信任邊界是整個微分段 demo 的地基：
+#   aegis    — 應用與其相依的本地基礎設施，套用最嚴格的 Pod Security「restricted」等級。
+#              任何嘗試以 root 執行、掛載 hostPath、開啟特權容器或保留 Linux capabilities
+#              的 workload，都會在 API Server 的 admission 階段就被擋掉，根本進不到排程器。
+#              這是 ForgeHacks「容器邊界防禦」的第一道防線（在網路策略之前就先擋）。
+#   attacker — 攻擊模擬用。刻意降到「baseline」等級，否則連攻擊 Pod 都起不來就沒戲唱了。
+#              但 baseline 仍然禁止特權容器、hostPID/hostNetwork、危險的 capabilities，
+#              代表「就算攻擊者拿到一個立足點，也還是被關在 namespace 邊界裡」。
+#
+# 註：observability namespace 由模組 D/F（kube-prometheus-stack）建立，這裡不重複定義，
+#     以免兩個平行 agent 互相覆蓋。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    # Pod Security Admission：restricted 是 K8s 內建三級標準中最嚴格的一級。
+    # enforce 會直接拒絕違規 Pod；audit/warn 讓違規在稽核日誌與 kubectl 輸出中現形，
+    # 三者都設上去，是為了在 demo 中能同時「擋下來」又「看得見」。
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.31
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: v1.31
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: v1.31
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: attacker
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+    # 攻擊模擬 Pod 需要能正常啟動才能發動攻擊，因此只套用 baseline。
+    # baseline 仍然封鎖 privileged、hostNetwork、hostPID、hostPath 等高風險設定，
+    # 我們要展示的是「網路層被 eBPF 擋下」，而不是「Pod 根本建不起來」。
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: v1.31
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

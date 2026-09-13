@@ -1,0 +1,70 @@
+# Aegis-Enclave 程式碼審查責任歸屬
+#
+# 這份檔案是 docs/CONTRACT.md 第 8 節「路徑所有權」在 GitHub 上的強制執行機制：
+# 七個模組平行開發，靠 CODEOWNERS 確保沒有人在不知情的情況下改到別人的目錄。
+#
+# 語法要點（踩過的坑）：
+#   - 後出現的規則會覆寫先前的規則，因此「愈具體的路徑要放在愈後面」。
+#   - 只有具備 repo 寫入權限的帳號或團隊才會被視為有效 owner，
+#     拼錯的 handle 不會報錯，而是安靜地讓該路徑變成無人審查。
+#   - 要讓 CODEOWNERS 真正生效，需在 branch protection 開啟
+#     "Require review from Code Owners"。
+#
+# TODO（協調者）：目前所有模組暫由 repo 擁有者兜底。待組員加入 organization
+# 後，請把下方各模組的 owner 換成實際的 @quantumworld-dpdns-io/<team> 團隊，
+# 以免單點審查成為交付瓶頸。
+
+# --- 預設：未被下方任何規則涵蓋的檔案 ---
+*                                   @dennislee928
+
+# --- 專案骨架（根目錄檔案）---
+/README.md                          @dennislee928
+/Makefile                           @dennislee928
+/.gitignore                         @dennislee928
+/.dockerignore                      @dennislee928
+/.editorconfig                      @dennislee928
+/.env.example                       @dennislee928
+/scripts/bootstrap.sh               @dennislee928
+/scripts/doctor.sh                  @dennislee928
+
+# --- 模組 A：Solidity 合約 ---
+# 合約一旦部署即不可變，且直接持有碳權資產，因此變更門檻應該是全 repo 最高的。
+/contracts/                         @dennislee928
+
+# --- 模組 B：Go 零信任閘道 ---
+/services/gateway/                  @dennislee928
+
+# --- 模組 C：Python 資料安全服務 ---
+/services/dataplane/                @dennislee928
+
+# --- 模組 D：Terraform 基礎設施 ---
+/infra/terraform/                   @dennislee928
+
+# --- 模組 E：Cilium 網路策略 ---
+# 微分段策略的誤放行是最容易被忽略的高風險變更，需要獨立審查視角。
+/infra/k8s/                         @dennislee928
+
+# --- 模組 F：可觀測性 ---
+# 指標名稱是跨模組契約，改名會直接讓告警規則與儀表板失效。
+/infra/observability/               @dennislee928
+
+# --- 模組 G：文件、威脅建模與 demo 腳本 ---
+/docs/                              @dennislee928
+/scripts/demo-tln.sh                @dennislee928
+/scripts/demo-fincyber.sh           @dennislee928
+/scripts/demo-forgehacks.sh         @dennislee928
+/scripts/demo-climatechain.sh       @dennislee928
+/scripts/demo-hacktitan.sh          @dennislee928
+/scripts/attack-sim/                @dennislee928
+
+# --- CI / 供應鏈 ---
+# workflow 具備 repo 權杖存取能力，是供應鏈攻擊的首要目標；
+# CODEOWNERS 與 dependabot 自身也放在這裡，避免有人靜靜地把審查者移除。
+/.github/                           @dennislee928
+/.github/workflows/                 @dennislee928
+/.github/CODEOWNERS                 @dennislee928
+/.github/dependabot.yml             @dennislee928
+
+# --- 跨模組介面契約：最後一條，優先度最高 ---
+# 改這個檔案等於改所有模組的假設，必須由協調者親自過目。
+/docs/CONTRACT.md                   @dennislee928

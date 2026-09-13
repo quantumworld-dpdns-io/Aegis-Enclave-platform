@@ -1,0 +1,434 @@
+# 零信任閘道告警規則（TLN 主軸：威脅攔截與稽核 / CCSP Domain 5）
+#
+# 依賴指標（CONTRACT.md 第 3 節，gateway 產出）：
+#   aegis_http_requests_total{method,route,status}
+#   aegis_http_request_duration_seconds{method,route}（histogram）
+#   aegis_authn_failures_total{reason}
+#   aegis_authz_denied_total{subject,resource}
+#   aegis_ratelimit_throttled_total{subject}
+#
+# 高基數注意事項：
+#   authz_denied 與 ratelimit_throttled 帶 subject 標籤，本身即為高基數維度。
+#   規則中一律先 sum by (subject) 收斂，且不再與其他高基數標籤交叉聚合，
+#   避免規則評估時產生笛卡兒式的序列爆炸。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-zero-trust-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aegis-zero-trust-gateway
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: alert-rules
+    aegis.io/module: observability
+    prometheus: kube-prometheus-stack-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: aegis.zero-trust.authn
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 1. 憑證「缺失」類的驗證失敗突增
+        #    reason=missing_token / no_client_cert 代表請求根本沒帶憑證。
+        #    這通常是掃描器、設定錯誤的用戶端，或是攻擊者在探測哪些端點不需驗證。
+        # ------------------------------------------------------------------
+        - alert: AegisAuthnMissingCredentialSpike
+          expr: |
+            sum by (reason) (rate(aegis_authn_failures_total{reason=~"missing_token|no_client_cert"}[5m])) > 0.2
+          for: 5m
+          labels:
+            severity: warning
+            category: authentication
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 驗證失敗突增（憑證缺失類，reason={{ $labels.reason }}）
+            description: >-
+              【發生什麼】原因為 {{ $labels.reason }} 的驗證失敗速率達
+              {{ $value | printf "%.3f" }} 次/秒，持續 5 分鐘以上。
+              【為什麼重要】這類失敗代表請求連憑證都沒有帶。在零信任模型下這是最外層防線被觸碰的訊號：
+              可能只是雜訊，但也常是攻擊鏈的第一步——攻擊者先用無憑證請求列舉端點，
+              找出忘記加驗證的路徑，再集中火力。
+              【可能原因】(1) 外部掃描器或機器人；(2) 用戶端未掛載 mTLS 憑證（AEGIS_REQUIRE_MTLS=true 時
+              所有請求都需要用戶端憑證）；(3) 健康檢查誤打到需驗證的路徑；
+              (4) 憑證 Secret 未正確掛載到呼叫方 Pod。
+            runbook: >-
+              1. 先分辨內外部來源：kubectl -n aegis logs deploy/gateway | jq 'select(.event=="authn.failure")'
+              取出 request_id 與來源，確認是叢集內的服務還是外部流量。
+              2. 若來源是叢集內部，檢查呼叫方的憑證 Secret 掛載與 JWKS 路徑（AEGIS_JWKS_PATH）。
+              3. 若來源是 attacker namespace，交叉比對 AegisAttackerNamespaceTrafficDetected，
+              這代表攻擊模擬（或真實攻擊）已進入探測階段。
+              4. 確認 /healthz 與 /readyz 仍維持免驗證，且沒有其他端點被誤設為公開。
+
+        # ------------------------------------------------------------------
+        # 2. 憑證「無效」類的驗證失敗
+        #    reason=invalid_signature / expired 代表對方帶了憑證但驗不過。
+        #    簽章無效的嚴重度遠高於缺失：那是主動偽造，不是設定失誤。
+        # ------------------------------------------------------------------
+        - alert: AegisAuthnInvalidSignatureDetected
+          expr: |
+            sum by (reason) (increase(aegis_authn_failures_total{reason=~"invalid_signature|expired"}[10m])) > 3
+          for: 0m
+          labels:
+            severity: critical
+            category: authentication
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 偵測到無效／過期憑證（reason={{ $labels.reason }}，10 分鐘 {{ $value | printf "%.0f" }} 次）
+            description: >-
+              【發生什麼】原因為 {{ $labels.reason }} 的驗證失敗在 10 分鐘內累積
+              {{ $value | printf "%.0f" }} 次。
+              【為什麼重要】invalid_signature 代表對方送出了一個「長得像 JWT 但簽章驗不過」的憑證，
+              這是主動偽造 token 的行為，不會是單純的設定失誤。
+              expired 則可能是重放攻擊（replay）——攻擊者拿到舊的錄製流量重送。
+              兩者都代表攻擊者已經知道我們的驗證機制長什麼樣子。
+              【可能原因】(1) token 偽造或篡改（改 claims 後未重新簽章）；(2) 錄製流量重放；
+              (3) 簽發端輪替金鑰但 JWKS 未同步；(4) 用戶端與伺服器時鐘偏移導致誤判 expired。
+            runbook: >-
+              1. 先排除良性原因：確認 AEGIS_JWKS_PATH 掛載的公鑰是否為最新，
+              以及 gateway 與簽發端的時鐘偏移是否在容忍範圍內。
+              2. 若排除設定問題，視為主動攻擊：從稽核日誌取出被拒 token 的 issuer 與 audience，
+              確認是否有人在猜測 AEGIS_JWT_ISSUER / AEGIS_JWT_AUDIENCE。
+              3. 檢查同一來源是否曾經成功通過驗證；若有，代表憑證外流，必須輪替簽發金鑰並撤銷該身分。
+              4. 對 expired 類，確認是否已啟用 jti 或 nonce 的重放防護；若無，列為改善項。
+              5. 在「Aegis / SIEM 總覽」儀表板的威脅事件時間軸上標記此事件，用於後續攻擊鏈重建。
+
+    - name: aegis.zero-trust.authz
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 3. 同一 subject 反覆被拒（縱向探測：同一資源猛試）
+        # ------------------------------------------------------------------
+        - alert: AegisAuthzDenialProbing
+          expr: |
+            sum by (subject) (increase(aegis_authz_denied_total[10m])) > 10
+          for: 2m
+          labels:
+            severity: warning
+            category: authorization
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 假名 {{ $labels.subject }} 在 10 分鐘內被拒 {{ $value | printf "%.0f" }} 次
+            description: >-
+              【發生什麼】假名主體 {{ $labels.subject }} 於 10 分鐘內累積
+              {{ $value | printf "%.0f" }} 次授權拒絕。
+              【為什麼重要】驗證成功但授權失敗，意味著對方持有「有效身分」卻在存取不屬於自己的資源。
+              這比單純的驗證失敗更值得注意：身分是真的，意圖才是問題。
+              持續的拒絕紀錄是權限提升嘗試（privilege escalation）的標準前兆。
+              【可能原因】(1) 攻擊者以合法帳號探測授權邊界；(2) 用戶端程式碼錯誤，
+              重試不該存取的資源；(3) 授權政策剛變更，舊有合法流量被誤拒
+              （請確認是否有近期的政策部署）。
+            runbook: >-
+              1. 先確認不是自己造成的：檢查最近是否部署過授權政策變更，
+              若時間點吻合則優先當作誤拒（false deny）處理，避免影響正常業務。
+              2. 若非政策變更，列出該假名嘗試過的資源：
+              sum by (resource) (increase(aegis_authz_denied_total{subject="{{ $labels.subject }}"}[1h]))
+              判斷探測範圍是集中還是分散。
+              3. 比對該假名是否同時有成功的請求；若「成功少、失敗多」，高度可疑。
+              4. 遏制：對該 subject 加嚴限流，必要時撤銷其身分並要求重新簽發。
+
+        # ------------------------------------------------------------------
+        # 4. 同一 subject 橫向探測多個不同資源（權限枚舉）
+        #    count by (subject) 計算「有被拒紀錄的 resource 種類數」，
+        #    廣度比次數更能區分「程式重試」與「有意的權限枚舉」。
+        # ------------------------------------------------------------------
+        - alert: AegisAuthzResourceEnumeration
+          expr: |
+            count by (subject) (
+              sum by (subject, resource) (increase(aegis_authz_denied_total[10m])) > 0
+            ) > 3
+          for: 2m
+          labels:
+            severity: critical
+            category: authorization
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 假名 {{ $labels.subject }} 橫向探測 {{ $value | printf "%.0f" }} 種不同資源
+            description: >-
+              【發生什麼】假名主體 {{ $labels.subject }} 在 10 分鐘內對
+              {{ $value | printf "%.0f" }} 種不同資源觸發授權拒絕。
+              【為什麼重要】「同一資源被拒很多次」可能只是用戶端重試；
+              「很多種不同資源都被拒」則幾乎只有一種解釋——對方正在系統性地測試自己能碰到什麼。
+              這是權限枚舉攻擊，屬於攻擊鏈中的偵察階段，通常緊接著就是實際的資料存取嘗試。
+              【可能原因】(1) 自動化權限掃描工具；(2) 攻擊者取得低權限憑證後尋找可利用的資源；
+              (3) 遭入侵的內部帳號被用於橫向移動偵察。
+            runbook: >-
+              1. 視為進行中的攻擊處理：先阻斷再調查。撤銷該 subject 的授權或直接封鎖來源。
+              2. 用稽核日誌重建完整攻擊時序（CONTRACT.md 第 4 節的 event=authz.decision 事件）：
+              kubectl -n aegis logs deploy/gateway | jq 'select(.subject=="{{ $labels.subject }}")'
+              並按 ts 排序，記錄對方嘗試的資源順序。
+              3. 檢查是否有任何一次 decision=allow；若有，那些資源就是實際的暴露面，必須逐筆評估影響。
+              4. 確認該假名對應的憑證簽發來源，判斷是憑證外流還是內部帳號被入侵。
+              5. 事件結束後把攻擊時序寫入 SIEM 稽核報告，這正是 TLN 要求的日誌審計證據。
+
+        # ------------------------------------------------------------------
+        # 5. 授權拒絕占總請求比例過高（宏觀視角，抓大範圍誤設或大規模攻擊）
+        # ------------------------------------------------------------------
+        - alert: AegisAuthzDenyRatioHigh
+          expr: |
+            (
+              sum(rate(aegis_authz_denied_total[10m]))
+              /
+              clamp_min(sum(rate(aegis_http_requests_total[10m])), 0.001)
+            ) > 0.3
+            and
+            sum(rate(aegis_http_requests_total[10m])) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+            category: authorization
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 全閘道有 {{ $value | printf "%.1f" }} 比例的請求被授權拒絕
+            description: >-
+              【發生什麼】過去 10 分鐘，授權拒絕數占總請求數的比例為
+              {{ $value | printf "%.3f" }}（門檻 0.3）。
+              【為什麼重要】超過三成的請求被拒，兩種情境都很嚴重：
+              要嘛授權政策部署出錯導致正常業務大面積中斷（可用性事件），
+              要嘛系統正遭受大規模的自動化探測（安全事件）。兩者的處置方向完全相反，必須先分辨。
+              【可能原因】(1) 授權政策誤設，例如角色對應表載入失敗導致 fail-closed；
+              (2) 大規模分散式探測；(3) 上游服務使用了錯誤的身分呼叫。
+            runbook: >-
+              1. 先看被拒的 subject 分散度：如果集中在少數幾個假名 → 偏向攻擊；
+              如果幾乎所有假名都被拒 → 偏向政策誤設。
+              2. 政策誤設的情況：檢查 gateway 啟動日誌中授權政策的載入筆數，
+              確認不是 0，必要時回滾上一版政策設定。
+              3. 攻擊的情況：走 AegisAuthzResourceEnumeration 的處置流程。
+              4. 注意 fail-closed 是正確的安全預設，不要為了恢復服務而改成 fail-open。
+
+    - name: aegis.zero-trust.ratelimit
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 6. 單一 subject 頻繁被限流
+        # ------------------------------------------------------------------
+        - alert: AegisRateLimitThrottlingPerSubject
+          expr: |
+            sum by (subject) (rate(aegis_ratelimit_throttled_total[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+            category: rate-limit
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 假名 {{ $labels.subject }} 持續被限流（{{ $value | printf "%.2f" }} 次/秒）
+            description: >-
+              【發生什麼】假名主體 {{ $labels.subject }} 的請求被限流的速率為
+              {{ $value | printf "%.2f" }} 次/秒，持續 5 分鐘以上。
+              【為什麼重要】限流被觸發本身代表控制正常運作（這是好事，可作為 demo 證據），
+              但「持續」被限流代表對方沒有退讓，仍在以超過 AEGIS_RATE_LIMIT_RPS 的速率施壓。
+              正常的用戶端遇到 429 會退避重試；不退避的通常是攻擊工具或失控的自動化程式。
+              【可能原因】(1) 暴力破解或列舉工具；(2) 用戶端缺少指數退避邏輯的重試風暴；
+              (3) 限流門檻對合法批次作業設得過低。
+            runbook: >-
+              1. 判斷是攻擊還是誤傷：檢查該假名的請求是否集中在單一路徑（攻擊特徵）
+              或分散在正常業務路徑（可能是門檻過低）。
+              2. 若為合法批次作業，評估調整 AEGIS_RATE_LIMIT_RPS / AEGIS_RATE_LIMIT_BURST，
+              但務必逐 subject 調整，不要放寬全域門檻。
+              3. 若為攻擊，交叉比對 AegisAuthnInvalidSignatureDetected 與
+              AegisAuthzResourceEnumeration，確認是否屬於同一攻擊鏈。
+              4. 在「Aegis / SIEM 總覽」的限流面板截圖留存，這是零信任控制生效的直接證據。
+
+        # ------------------------------------------------------------------
+        # 7. 全叢集限流大量觸發（疑似分散式攻擊或 DoS）
+        # ------------------------------------------------------------------
+        - alert: AegisRateLimitStormClusterWide
+          expr: |
+            sum(rate(aegis_ratelimit_throttled_total[5m])) > 10
+          for: 3m
+          labels:
+            severity: critical
+            category: rate-limit
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 全閘道限流風暴（{{ $value | printf "%.1f" }} 次/秒被限流）
+            description: >-
+              【發生什麼】全閘道被限流的請求速率達 {{ $value | printf "%.1f" }} 次/秒。
+              【為什麼重要】大量限流意味著閘道正承受遠超設計容量的流量。
+              限流機制正在保護下游的 dataplane 與 KMS 不被打穿，
+              但同時合法使用者也很可能已經受到影響，這是可用性與安全性同時受壓的狀態。
+              【可能原因】(1) 分散式的自動化攻擊（多個 subject 同時施壓）；
+              (2) 上游服務故障後的重試放大效應；(3) 壓力測試誤打；(4) 限流門檻設定過低。
+            runbook: >-
+              1. 統計涉及的假名數量：count(sum by (subject) (rate(aegis_ratelimit_throttled_total[5m])) > 0)
+              數量少 → 集中式攻擊，可逐一封鎖；數量多 → 分散式，需在入口層處置。
+              2. 確認下游是否已受影響：檢查 dataplane 的 p99 延遲與 KMS 錯誤率。
+              3. 若下游健康，維持現狀讓限流繼續吸收攻擊，不要急著放寬門檻。
+              4. 若為分散式攻擊，考慮在 Cilium 層加上來源網段的封鎖策略。
+
+    - name: aegis.zero-trust.slo
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 8. 5xx 錯誤率劣化（依路徑分群）
+        # ------------------------------------------------------------------
+        - alert: AegisGateway5xxErrorRateHigh
+          expr: |
+            (
+              sum by (route) (rate(aegis_http_requests_total{status=~"5.."}[5m]))
+              /
+              clamp_min(sum by (route) (rate(aegis_http_requests_total[5m])), 0.001)
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            category: availability
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 路徑 {{ $labels.route }} 的 5xx 錯誤率達 {{ $value | printf "%.3f" }}
+            description: >-
+              【發生什麼】路徑 {{ $labels.route }} 過去 5 分鐘的 5xx 錯誤比例為
+              {{ $value | printf "%.3f" }}（門檻 0.05）。
+              【為什麼重要】可用性也是資安控制的一部分。此外 5xx 常是「安全控制失效」的間接症狀：
+              例如 KMS 不可用導致加解密失敗、授權政策載入失敗導致內部錯誤。
+              安全事件經常先以 5xx 的形式浮現。
+              【可能原因】(1) 下游 dataplane 或 KMS 故障；(2) 授權／驗證元件初始化失敗；
+              (3) 資源不足（OOM、連線池耗盡）；(4) 近期部署引入的迴歸。
+            runbook: >-
+              1. 交叉比對 AegisKmsErrorRatioHigh 與 AegisServiceDown，先判斷是不是下游拖累。
+              2. 取出實際錯誤：kubectl -n aegis logs deploy/gateway | jq 'select(.level=="error")'
+              並確認錯誤訊息中沒有洩漏金鑰材料或 PII（這本身也是需要修的問題）。
+              3. 確認 dataplane 可達性：AEGIS_DATAPLANE_URL 指向的服務是否正常回應 /internal/healthz。
+              4. 若時間點與部署吻合，優先回滾。
+
+        - alert: AegisGateway5xxErrorRateCritical
+          expr: |
+            (
+              sum by (route) (rate(aegis_http_requests_total{status=~"5.."}[5m]))
+              /
+              clamp_min(sum by (route) (rate(aegis_http_requests_total[5m])), 0.001)
+            ) > 0.2
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 路徑 {{ $labels.route }} 的 5xx 錯誤率超過 20%（{{ $value | printf "%.3f" }}）
+            description: >-
+              【發生什麼】路徑 {{ $labels.route }} 每五個請求就有超過一個失敗，
+              目前錯誤比例 {{ $value | printf "%.3f" }}。
+              【為什麼重要】此等級的失敗率代表該功能實質上已不可用。
+              對金融合約系統而言，寫入路徑失敗可能造成交易紀錄遺失，
+              而讀取路徑失敗會讓稽核查詢無法進行。
+              【可能原因】與 AegisGateway5xxErrorRateHigh 相同，但通常是下游完全不可用。
+            runbook: >-
+              1. 依 AegisGateway5xxErrorRateHigh 的步驟排查，但直接跳到「確認下游存活」。
+              2. 若為寫入路徑（POST /api/v1/vault/records），確認沒有任何「加密失敗仍寫入」的降級行為。
+              3. 通報事件負責人，並在事件單中記錄影響時間窗以便後續對帳。
+
+        # ------------------------------------------------------------------
+        # 9. p99 延遲劣化
+        #    histogram_quantile 的標準寫法：先對 _bucket 套 rate()，
+        #    再 sum by (le, ...) 聚合，最後才取分位數。順序錯了結果就沒有意義。
+        #    後面用 _count 的速率作為流量守門，避免低流量時分位數劇烈跳動造成誤報。
+        # ------------------------------------------------------------------
+        - alert: AegisGatewayLatencyP99Degraded
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, route) (rate(aegis_http_request_duration_seconds_bucket[5m]))
+            ) > 1.5
+            and
+            sum by (route) (rate(aegis_http_request_duration_seconds_count[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            category: performance
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 路徑 {{ $labels.route }} 的 p99 延遲達 {{ $value | printf "%.3f" }} 秒
+            description: >-
+              【發生什麼】路徑 {{ $labels.route }} 的 p99 請求延遲為
+              {{ $value | printf "%.3f" }} 秒，超過 1.5 秒門檻，且流量足以讓分位數有統計意義。
+              【為什麼重要】零信任閘道在每個請求上都要做驗簽、授權判斷與（讀取路徑）呼叫下游解密，
+              延遲劣化通常指向其中某一段。若延遲來自 KMS，代表加密操作正在排隊，
+              而排隊變長有時是資源耗盡型攻擊的副作用。
+              【可能原因】(1) KMS 呼叫變慢（查 aegis_kms_operation_duration_seconds）；
+              (2) JWKS 驗簽的快取失效導致每次都重新解析；(3) 下游 dataplane 資源不足；
+              (4) 大量請求排隊，與限流告警同時出現。
+            runbook: >-
+              1. 拆解延遲來源：比較 gateway 的 p99 與 dataplane 的
+              histogram_quantile(0.99, sum by (le, operation) (rate(aegis_kms_operation_duration_seconds_bucket[5m])))
+              判斷瓶頸在閘道自身還是下游 KMS。
+              2. 確認是否與 AegisRateLimitStormClusterWide 同時發生；若是，延遲可能是攻擊的結果而非原因。
+              3. 檢查 gateway Pod 的 CPU throttling 與記憶體使用率。
+              4. 不要為了降低延遲而放寬 mTLS 或驗簽要求，那是拿安全換效能。
+
+        - alert: AegisGatewayLatencyP99Critical
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, route) (rate(aegis_http_request_duration_seconds_bucket[5m]))
+            ) > 3
+            and
+            sum by (route) (rate(aegis_http_request_duration_seconds_count[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: critical
+            category: performance
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 路徑 {{ $labels.route }} 的 p99 延遲超過 3 秒（{{ $value | printf "%.3f" }} 秒）
+            description: >-
+              【發生什麼】路徑 {{ $labels.route }} 的 p99 延遲為 {{ $value | printf "%.3f" }} 秒。
+              【為什麼重要】多數用戶端的預設逾時在 3 至 5 秒之間，此延遲下請求會開始超時並觸發重試，
+              重試又進一步加重負載，形成惡性循環。
+              【可能原因】與 AegisGatewayLatencyP99Degraded 相同，但已進入級聯失效的邊緣。
+            runbook: >-
+              1. 依 AegisGatewayLatencyP99Degraded 的步驟排查，並同時確認是否已出現 5xx 告警。
+              2. 若判定為級聯失效，優先確認限流仍在運作以保護下游，再逐步擴充容量。
+
+        # ------------------------------------------------------------------
+        # 10. 401/403 回應突增（未授權路徑探測的 HTTP 層視角）
+        #     與 authn/authz 指標互補：這裡看的是「路徑」維度，
+        #     可以看出攻擊者在敲哪些不存在或不該存在的端點。
+        # ------------------------------------------------------------------
+        - alert: AegisUnauthorizedPathProbing
+          expr: |
+            sum by (route, status) (rate(aegis_http_requests_total{status=~"40(1|3)"}[5m])) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            category: threat-detection
+            competition: tln
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 路徑 {{ $labels.route }} 出現大量 {{ $labels.status }} 回應
+            description: >-
+              【發生什麼】路徑 {{ $labels.route }} 回傳 HTTP {{ $labels.status }} 的速率達
+              {{ $value | printf "%.2f" }} 次/秒。
+              【為什麼重要】從路徑維度看未授權回應，可以直接讀出攻擊者的意圖。
+              若集中在 /api/v1/vault/records 系列，目標是資料；
+              若集中在 /api/v1/carbon/retire，目標是碳權合約的資產操作。
+              這是把零散的拒絕事件轉化為「攻擊目標推斷」的關鍵維度。
+              【可能原因】(1) 端點列舉掃描；(2) 憑證失效後的用戶端重試；
+              (3) 前端版本不一致，仍在呼叫已下線的路徑。
+            runbook: >-
+              1. 對照「Aegis / SIEM 總覽」的 HTTP 狀態碼分布面板，確認是單一路徑還是全面性。
+              2. 若集中在單一敏感路徑，視為針對性攻擊，對該路徑加嚴限流並記錄來源。
+              3. 401 與 403 要分開看：401 是身分問題（沒通過驗證），403 是權限問題（身分有效但無權限）。
+              大量 403 比大量 401 更值得警戒，因為對方已經有有效身分。

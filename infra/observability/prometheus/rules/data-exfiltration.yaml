@@ -1,0 +1,311 @@
+# 資料外洩偵測告警規則（Financial Cybersecurity Challenge 主軸 / CCSP Domain 5）
+#
+# 設計原則：
+#   1. 所有 counter 一律套 rate() 或 increase()，不直接比較累計值。
+#   2. 比值型告警的分母一律用 clamp_min() 保護，避免除以零產生 +Inf 而誤報。
+#   3. subject 標籤是 dataplane 以 HMAC-SHA256 產生的假名（見 CONTRACT.md 第 3、4 節），
+#      告警訊息只轉述假名，嚴禁在 annotation 範本內嘗試還原真實身分。
+#   4. 僅依賴 CONTRACT.md 第 3 節鎖定的指標名稱與標籤，不得要求服務端更名。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-data-exfiltration
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aegis-data-exfiltration
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: alert-rules
+    aegis.io/module: observability
+    # kube-prometheus-stack 已設定 ruleSelectorNilUsesHelmValues=false，
+    # 因此下列兩個標籤只是為了與社群慣例一致，並非被採用的必要條件。
+    prometheus: kube-prometheus-stack-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: aegis.data-exfiltration
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 1. 單一 subject 解密速率相對自身基線異常飆高
+        #    這是「內部人員大量拉取資料」最直接的訊號：帳號本身有合法權限，
+        #    所以不會產生授權拒絕，只能靠行為基線偏移抓出來。
+        #    基線取前一小時（[1h] offset 1h），加上 0.05 的常數同時扮演兩個角色：
+        #      (a) 避免新出現的 subject 因基線為 0 而永遠比不出來；
+        #      (b) 作為速率下限，過濾掉低流量造成的百分比雜訊。
+        # ------------------------------------------------------------------
+        - alert: AegisKmsDecryptRateAnomalousPerSubject
+          expr: |
+            (
+              sum by (subject) (rate(aegis_kms_decrypt_total[5m]))
+              >
+              3 * (sum by (subject) (rate(aegis_kms_decrypt_total[1h] offset 1h)) + 0.05)
+            )
+            and
+            (
+              sum by (subject) (rate(aegis_kms_decrypt_total[5m])) > 0.2
+            )
+          for: 5m
+          labels:
+            severity: warning
+            category: data-exfiltration
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 假名 {{ $labels.subject }} 的解密速率偏離基線三倍以上
+            description: >-
+              【發生什麼】假名主體 {{ $labels.subject }} 目前的資料金鑰解密速率為
+              {{ $value | printf "%.3f" }} 次/秒，已超過該主體前一小時基線的三倍。
+              【為什麼重要】解密量暴增而授權未被拒絕，代表這是一個「有合法權限但行為異常」的帳號，
+              符合內部人員大量匯出資料（insider data exfiltration）的典型特徵，
+              也可能是憑證外流後被攻擊者以正常身分使用。
+              【可能原因】(1) 內部人員批次下載紀錄；(2) JWT 或用戶端憑證外流；
+              (3) 自動化作業（報表、備份、資料遷移）未事先報備；(4) 應用程式重試風暴造成重複解密。
+            runbook: >-
+              1. 開啟 Grafana「Aegis / 資料保護」儀表板的「異常解密 subject 排行」面板，
+              確認此假名是否為單一尖峰或持續性行為。
+              2. 以假名查稽核日誌關聯出實際請求：
+              kubectl -n aegis logs deploy/gateway | jq 'select(.subject=="{{ $labels.subject }}")'
+              並比對 request_id / trace_id 找出來源 IP 與呼叫路徑。
+              3. 檢查是否有對應的排程作業或工單；若無，立即視為疑似外洩事件。
+              4. 遏制手段：調降該 subject 的 AEGIS_RATE_LIMIT_RPS，或於 gateway 授權政策中暫時撤銷
+              vault_reader 權限，再輪替該身分的簽發金鑰。
+              5. 依 CCSP Domain 5 事件處理流程，保留稽核日誌與 KMS 呼叫紀錄作為證據，不要先刪除 Pod。
+
+        # ------------------------------------------------------------------
+        # 2. 解密速率絕對值超標（不看基線的硬上限，作為第 1 條的補網）
+        # ------------------------------------------------------------------
+        - alert: AegisKmsDecryptRateCritical
+          expr: |
+            sum by (subject) (rate(aegis_kms_decrypt_total[5m])) > 5
+          for: 2m
+          labels:
+            severity: critical
+            category: data-exfiltration
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 假名 {{ $labels.subject }} 解密速率超過硬性上限（5 次/秒）
+            description: >-
+              【發生什麼】假名主體 {{ $labels.subject }} 的解密速率達
+              {{ $value | printf "%.3f" }} 次/秒，超過任何正常互動式使用情境的合理上限。
+              【為什麼重要】此速率意味著程式化的批次抽取，而非人工查詢；
+              以每筆紀錄一次信封解密估算，持續十分鐘即可導出數千筆敏感紀錄。
+              【可能原因】(1) 腳本化大量匯出；(2) 遭入侵的服務帳號被當成資料抽取管道；
+              (3) 壓力測試或 demo 腳本誤打到生產環境。
+            runbook: >-
+              1. 先遏制再調查：立即以限流或授權政策阻斷該 subject，避免持續外流。
+              2. 確認同時段 aegis_masking_bypass_total 是否也非零；若兩者同時發生，
+              代表資料以未遮罩形式流出，屬最高等級資料外洩事件。
+              3. 保存證據後再輪替 KMS 資料金鑰（alias/aegis-master）與假名化金鑰
+              （alias/aegis-pseudonym）。
+              4. 通報事件負責人並開立正式資安事件單。
+
+        # ------------------------------------------------------------------
+        # 3. 解密與加密比例失衡（讀遠多於寫）
+        #    正常的金融紀錄系統寫入與讀取應維持穩定比例；
+        #    比例突然拉高代表有人在「只讀不寫」地掃庫。
+        # ------------------------------------------------------------------
+        - alert: AegisKmsDecryptEncryptRatioImbalanced
+          expr: |
+            (
+              sum(rate(aegis_kms_decrypt_total[15m]))
+              /
+              clamp_min(sum(rate(aegis_kms_encrypt_total[15m])), 0.001)
+            ) > 20
+            and
+            sum(rate(aegis_kms_decrypt_total[15m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            category: data-exfiltration
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 全叢集解密／加密比例失衡（目前 {{ $value | printf "%.1f" }} 倍）
+            description: >-
+              【發生什麼】過去 15 分鐘資料面的解密次數是加密次數的
+              {{ $value | printf "%.1f" }} 倍，超過門檻 20 倍。
+              【為什麼重要】信封加密架構下，每寫入一筆紀錄會產生一次 encrypt、
+              每讀取一筆會產生一次 decrypt。比例長期失衡代表系統正被當成「資料倉庫」大量讀取，
+              而不是正常的交易寫入／查詢混合負載，是資料庫掃取（database enumeration）的宏觀指標。
+              【可能原因】(1) 廣泛的枚舉式讀取；(2) 前端快取失效導致重複讀取放大；
+              (3) 批次對帳或報表作業；(4) 寫入路徑故障導致 encrypt 歸零（請一併確認 5xx 告警）。
+            runbook: >-
+              1. 先排除「分母異常」：查看「KMS 操作速率」面板確認 encrypt 是否掉到 0，
+              若是，代表寫入路徑故障而非外洩，改依服務健康流程處理。
+              2. 若 encrypt 正常而 decrypt 暴增，用 topk(10, sum by (subject) (rate(aegis_kms_decrypt_total[15m])))
+              找出貢獻最大的假名主體，再走 AegisKmsDecryptRateAnomalousPerSubject 的處置步驟。
+              3. 評估是否需要對高頻讀取路徑 /api/v1/vault/records/:id 加上更嚴格的每日配額。
+
+        # ------------------------------------------------------------------
+        # 4. 遮罩失效（最高優先）
+        #    依 CONTRACT.md 第 3 節，aegis_masking_bypass_total 任何非零都代表
+        #    未遮罩的敏感欄位已經離開資料面，必須立即告警，不設容忍期。
+        # ------------------------------------------------------------------
+        - alert: AegisMaskingBypassDetected
+          expr: |
+            sum by (field_type, reason) (increase(aegis_masking_bypass_total[15m])) > 0
+          for: 0m
+          labels:
+            severity: critical
+            category: data-protection
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+            page: "true"
+          annotations:
+            summary: 遮罩失效！欄位型別 {{ $labels.field_type }} 有 {{ $value | printf "%.0f" }} 次未遮罩輸出
+            description: >-
+              【發生什麼】過去 15 分鐘內，欄位型別 {{ $labels.field_type }} 發生
+              {{ $value | printf "%.0f" }} 次遮罩失效，失效原因標籤為 {{ $labels.reason }}。
+              【為什麼重要】這代表原始敏感資料（PII／金融帳號等）已以未遮罩形式離開 dataplane
+              並回傳給呼叫方。這是實質的資料保護控制失效，不是效能問題，
+              對應 CCSP Domain 5 中「安全控制失效必須即時偵測」的要求，任何非零值都要處置。
+              【可能原因】(1) 新增欄位未登錄到遮罩規則表；(2) 遮罩規則設定檔載入失敗而 fail-open；
+              (3) 假名化金鑰 alias/aegis-pseudonym 不可用導致降級輸出；
+              (4) 程式碼變更引入了繞過遮罩的回傳路徑。
+            runbook: >-
+              1. 立即確認失效原因：kubectl -n aegis logs deploy/dataplane | jq 'select(.event | test("masking"))'
+              找出 reason={{ $labels.reason }} 對應的程式路徑。
+              2. 判斷影響範圍：以同時段 aegis_kms_decrypt_total 的量估算有多少筆紀錄可能已未遮罩外流。
+              3. 若原因是設定載入失敗，優先讓遮罩改為 fail-closed（回傳錯誤而非原始資料），
+              寧可中斷服務也不可洩漏。
+              4. 通報資料保護負責人，依個資事故流程評估通報義務，並保留稽核日誌。
+              5. 修復後在 Grafana「Aegis / 資料保護」儀表板確認遮罩失效 stat 面板回到 0。
+
+        # ------------------------------------------------------------------
+        # 5. KMS 錯誤率升高（可能是金鑰權限被竄改）
+        #    分母用 aegis_kms_operation_duration_seconds_count，
+        #    因為它與 aegis_kms_errors_total 共用 (driver, operation) 標籤，可直接對齊。
+        # ------------------------------------------------------------------
+        - alert: AegisKmsErrorRatioHigh
+          expr: |
+            (
+              sum by (driver, operation) (rate(aegis_kms_errors_total[5m]))
+              /
+              clamp_min(
+                sum by (driver, operation) (rate(aegis_kms_operation_duration_seconds_count[5m])),
+                0.001
+              )
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            category: key-management
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: KMS 錯誤率過高（driver={{ $labels.driver }} operation={{ $labels.operation }}，比例 {{ $value | printf "%.3f" }}）
+            description: >-
+              【發生什麼】driver {{ $labels.driver }} 的 {{ $labels.operation }} 操作，
+              過去 5 分鐘錯誤比例為 {{ $value | printf "%.3f" }}（門檻 0.05）。
+              【為什麼重要】KMS 錯誤率上升往往不是單純的可用性問題。
+              若錯誤集中在 decrypt，可能是金鑰政策（key policy）或 encryption context 被竄改，
+              導致合法請求被拒；若集中在 encrypt，寫入路徑會失效並可能觸發降級為明文儲存的風險路徑。
+              【可能原因】(1) 金鑰政策／IAM 權限被變更或撤銷；(2) encryption context 與 AAD 不一致
+              （見 CONTRACT.md 第 6 節，兩者必須完全相同）；(3) KMS 端點不可達或憑證過期；
+              (4) 金鑰被停用或排程刪除。
+            runbook: >-
+              1. 取得實際錯誤訊息：kubectl -n aegis logs deploy/dataplane | jq 'select(.level=="error" and (.event | test("kms")))'
+              並區分 AccessDenied 類（權限問題）與連線逾時類（可用性問題）。
+              2. 若是 AccessDenied，立刻視為潛在的權限竄改事件：檢查 KMS 金鑰政策的變更稽核紀錄，
+              確認 alias/aegis-master 是否被改動或停用。
+              3. 若是 InvalidCiphertext 類錯誤，比對密文信封的 aad 與 KMS encryption context 是否一致。
+              4. 確認 driver 設定（AEGIS_KMS_DRIVER={{ $labels.driver }}）與對應端點環境變數正確。
+              5. 排除故障前不要清空 dataplane 日誌，那是唯一的權限竄改證據來源。
+
+        # ------------------------------------------------------------------
+        # 6. KMS 錯誤絕對次數暴增（低流量時期比值可能不敏感，用絕對值補網）
+        # ------------------------------------------------------------------
+        - alert: AegisKmsErrorBurst
+          expr: |
+            sum by (driver, operation) (increase(aegis_kms_errors_total[10m])) > 10
+          for: 0m
+          labels:
+            severity: critical
+            category: key-management
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: KMS 錯誤暴增（driver={{ $labels.driver }} operation={{ $labels.operation }}，10 分鐘 {{ $value | printf "%.0f" }} 次）
+            description: >-
+              【發生什麼】driver {{ $labels.driver }} 的 {{ $labels.operation }} 操作在 10 分鐘內
+              累積 {{ $value | printf "%.0f" }} 次錯誤。
+              【為什麼重要】密碼學操作連續失敗會讓資料面無法提供加解密服務；
+              在最壞情況下，若上游有任何 fail-open 邏輯，敏感資料可能以未加密形式落地。
+              【可能原因】與 AegisKmsErrorRatioHigh 相同，但強度更高，通常代表金鑰或端點已完全不可用。
+            runbook: >-
+              1. 確認 KMS 後端存活：對 localstack driver 檢查 svc/localstack:4566，
+              對 vault driver 檢查 svc/vault:8200 的封印（seal）狀態。
+              2. 確認 dataplane 沒有任何「加密失敗就直接寫入明文」的降級路徑；若有，立即停止寫入流量。
+              3. 依 AegisKmsErrorRatioHigh 的步驟 2、3 判斷是權限竄改還是可用性故障。
+
+        # ------------------------------------------------------------------
+        # 7. 解密持續發生但遮罩完全沒套用
+        #    這是「遮罩管線整段被繞過」的訊號：不是 bypass 計數增加，而是連 applied 都歸零。
+        # ------------------------------------------------------------------
+        - alert: AegisMaskingPipelineInactive
+          expr: |
+            sum(rate(aegis_kms_decrypt_total[10m])) > 0.05
+            and
+            sum(rate(aegis_masking_applied_total[10m])) == 0
+          for: 10m
+          labels:
+            severity: critical
+            category: data-protection
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 有解密流量但遮罩管線完全沒有作用
+            description: >-
+              【發生什麼】過去 10 分鐘持續有資料被解密（{{ $value | printf "%.3f" }} 次/秒），
+              但 aegis_masking_applied_total 的成長率為 0，代表沒有任何欄位被遮罩。
+              【為什麼重要】aegis_masking_bypass_total 只會在「偵測到自己繞過」時增加；
+              若整段遮罩管線根本沒被呼叫，bypass 也不會成長，這條規則就是用來補這個盲點的。
+              解密後未遮罩即回傳，等同於敏感資料直接對外暴露。
+              【可能原因】(1) 讀取路徑重構後漏接遮罩中介層；(2) 遮罩規則表為空或載入路徑錯誤；
+              (3) 功能旗標（feature flag）誤關遮罩；(4) 只有不需遮罩的欄位被讀取（唯一的良性情況）。
+            runbook: >-
+              1. 直接驗證行為，不要只看指標：呼叫 GET /api/v1/vault/records/:id 取一筆已知含敏感欄位的紀錄，
+              檢查回應是否為明文。
+              2. 若確認為明文，立即封鎖讀取路徑（Cilium L7 policy 暫時移除 /internal/v1/records 的 GET 放行）。
+              3. 檢查 dataplane 啟動日誌中遮罩規則的載入筆數，確認不是 0。
+              4. 若為良性情況（讀取的紀錄確實沒有敏感欄位），在 README 記錄並考慮調整門檻，不要直接靜音。
+
+        # ------------------------------------------------------------------
+        # 8. 非上班時段的大量解密
+        #    hour() 以 UTC 計算；台北時間 22:00–06:00 對應 UTC 14:00–22:00。
+        #    這條規則的價值在於「情境化」：同樣的量在上班時間可能正常，深夜則高度可疑。
+        # ------------------------------------------------------------------
+        - alert: AegisOffHoursBulkDecrypt
+          expr: |
+            sum by (subject) (increase(aegis_kms_decrypt_total[30m])) > 20
+            and on () (hour() >= 14 and hour() < 22)
+          for: 5m
+          labels:
+            severity: info
+            category: data-exfiltration
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 非上班時段（台北 22:00–06:00）假名 {{ $labels.subject }} 有大量解密
+            description: >-
+              【發生什麼】在台北時間深夜時段，假名主體 {{ $labels.subject }} 於 30 分鐘內
+              解密 {{ $value | printf "%.0f" }} 筆紀錄。
+              【為什麼重要】時間本身就是風險訊號。攻擊者偏好在監控人力最薄弱的時段行動，
+              而多數合法的互動式查詢不會出現在深夜。此規則刻意設為 info，
+              目的是在 SIEM 上留下可關聯的情境事件，而非直接呼叫值班人員。
+              【可能原因】(1) 深夜排程的批次作業（最常見的良性原因）；(2) 跨時區的合法使用者；
+              (3) 攻擊者刻意選在低監控時段抽取資料。
+            runbook: >-
+              1. 比對排程清單：確認是否有已登錄的深夜批次作業使用此假名。
+              2. 若無對應排程，將此事件與同時段的 AegisAuthzDenialProbing、
+              AegisCiliumPolicyDropSpike 交叉關聯，判斷是否屬於同一攻擊鏈。
+              3. 建議做法是把已登錄的批次作業改用獨立 subject，讓此規則的訊噪比長期維持可用。

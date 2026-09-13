@@ -1,0 +1,197 @@
+# 零信任閘道（Go + Gin）— 唯一的對外入口
+#
+# 本檔的 securityContext 是 ForgeHacks「Linux 容器邊界防禦」的展示重點。
+# 每一項設定都對應一種真實的容器逃逸或提權手法：
+#   runAsNonRoot / runAsUser      → 容器內即使被 RCE，攻擊者拿到的也只是 uid 10001 的無權限使用者。
+#                                    配合 user namespace 之外的 uid 對應，逃逸到節點也無法操作宿主檔案。
+#   allowPrivilegeEscalation:false → 在核心設定 no_new_privs，setuid 執行檔（如被植入的 sudo/pkexec）
+#                                    無法提權，直接封鎖 CVE-2021-4034 這類 pkexec 提權路徑。
+#   capabilities.drop: ["ALL"]     → 拿掉所有 Linux capabilities。沒有 CAP_SYS_ADMIN 就無法 mount、
+#                                    無法操作 cgroups、無法載入核心模組，容器逃逸的常見前置條件全斷。
+#   readOnlyRootFilesystem: true   → 根檔案系統唯讀，攻擊者無法落地 webshell、無法改寫二進位檔，
+#                                    只能寫入明確掛載的 emptyDir（/tmp），持久化手段被大幅壓縮。
+#   seccompProfile: RuntimeDefault → 套用 container runtime 的預設 seccomp 白名單，封鎖數十個
+#                                    極少用到卻是核心漏洞重災區的 syscall（如 keyctl、unshare 濫用）。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway-sa
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: aegis-enclave
+# 閘道不需要呼叫 Kubernetes API。不掛載 token，等於拿掉「容器被打下來後
+# 攻擊者拿 ServiceAccount token 橫向移動到 API Server」的整條攻擊鏈。
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  type: ClusterIP
+  # selector 刻意比 Cilium 策略的選擇器多帶一個 component=server。
+  # 原因：攻擊模擬會建立帶有 app.kubernetes.io/name=gateway 標籤的探針 Pod，
+  # 好讓它取得與 gateway 相同的 Cilium 身分（identity）；多這個標籤可以確保
+  # 探針 Pod 不會被誤加進 Service endpoints 而污染正常流量。
+  selector:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+      app.kubernetes.io/component: server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: aegis-enclave
+    spec:
+      serviceAccountName: gateway-sa
+      automountServiceAccountToken: false
+      # 不使用宿主機的網路 / PID / IPC namespace。共用任何一個都等於自願放棄
+      # namespace 隔離：hostNetwork 會讓 Cilium 的 Pod 層策略完全失效，
+      # hostPID 讓容器看得到並能攻擊節點上所有行程。
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: aegis/gateway:dev
+          # 映像由 `kind load docker-image` 直接塞進節點，叢集內沒有 registry，
+          # 用 Always 會讓 Pod 卡在 ImagePullBackOff。
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            # 以下變數對應 docs/CONTRACT.md 第 5 節，名稱與預設值不得擅改。
+            - name: AEGIS_LISTEN_ADDR
+              value: ":8080"
+            - name: AEGIS_METRICS_ADDR
+              value: ":9090"
+            - name: AEGIS_DATAPLANE_URL
+              value: "http://dataplane.aegis.svc.cluster.local:8000"
+            - name: AEGIS_JWT_ISSUER
+              value: "https://aegis.local"
+            - name: AEGIS_JWT_AUDIENCE
+              value: "aegis-gateway"
+            - name: AEGIS_JWKS_PATH
+              value: "/etc/aegis/jwks.json"
+            # ⚠️ 契約預設值是 true，本地 kind 展示環境刻意設為 false。
+            # 原因：kind 叢集中沒有部署 TLS 終止（無 Ingress、無 cert-manager、無 service mesh），
+            # 8080 依契約是明文 HTTP 埠，強制用戶端憑證會讓所有展示流量一律被拒。
+            # 正式環境務必改回 "true"，並由 Ingress 或 mTLS sidecar 提供並轉發用戶端憑證。
+            # 注意：關掉的只是傳輸層身分驗證，JWT 驗簽與授權政策仍然全程啟用。
+            - name: AEGIS_REQUIRE_MTLS
+              value: "false"
+            - name: AEGIS_RATE_LIMIT_RPS
+              value: "20"
+            - name: AEGIS_RATE_LIMIT_BURST
+              value: "40"
+            - name: AEGIS_OTEL_ENDPOINT
+              value: ""
+            - name: AEGIS_LOG_LEVEL
+              value: "info"
+          # 探針路徑取自 CONTRACT.md 第 2 節，兩者都不需要通過身分驗證，
+          # 因此即使 mTLS/JWT 全開，kubelet 仍探得到。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # 設定資源上下限不只是排程考量，也是可用性防護：
+          # 沒有 limits 的容器一旦被打成礦機或陷入無窮迴圈，會拖垮整個節點上的其他 workload。
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: jwks
+              mountPath: /etc/aegis
+              readOnly: true
+      volumes:
+        # 根檔案系統唯讀之後，唯一可寫的地方就是這塊記憶體型 emptyDir。
+        # 加上 sizeLimit 避免「寫爆 /tmp 把節點記憶體吃光」這種 DoS。
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+        # JWT 驗簽公鑰（JWKS）。標記 optional 是為了讓九個模組能平行開發：
+        # 模組 B 的測試金鑰尚未產出時，Pod 仍然排得起來，不會卡住整個部署。
+        # 建立方式見 infra/k8s/README.md 與 secrets.example.yaml。
+        - name: jwks
+          secret:
+            secretName: aegis-gateway-jwks
+            optional: true
