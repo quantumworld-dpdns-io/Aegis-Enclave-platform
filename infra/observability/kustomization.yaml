@@ -1,0 +1,59 @@
+# 模組 F 唯一套用入口：kubectl apply -k infra/observability
+#
+# Grafana sidecar（kube-prometheus-stack）會載入帶 grafana_dashboard=1 的 ConfigMap。
+# Prometheus Operator 會載入同 namespace 的 PrometheusRule / ServiceMonitor
+# （前提：模組 D 將 ruleSelectorNilUsesHelmValues 與
+#  serviceMonitorSelectorNilUsesHelmValues 設為 false，或 selector 能匹配本目錄標籤）。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: observability
+
+resources:
+  - prometheus/rules/data-exfiltration.yaml
+  - prometheus/rules/zero-trust-gateway.yaml
+  - prometheus/rules/microsegmentation.yaml
+  - prometheus/rules/service-health.yaml
+  - prometheus/servicemonitors/gateway.yaml
+  - prometheus/servicemonitors/dataplane.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: aegis-grafana-siem-overview
+    files:
+      - siem-overview.json=grafana/dashboards/siem-overview.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+        app.kubernetes.io/name: aegis-siem-overview
+        app.kubernetes.io/part-of: aegis-enclave
+        app.kubernetes.io/component: grafana-dashboard
+        aegis.io/module: observability
+      annotations:
+        grafana_folder: Aegis
+  - name: aegis-grafana-data-protection
+    files:
+      - data-protection.json=grafana/dashboards/data-protection.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+        app.kubernetes.io/name: aegis-data-protection
+        app.kubernetes.io/part-of: aegis-enclave
+        app.kubernetes.io/component: grafana-dashboard
+        aegis.io/module: observability
+      annotations:
+        grafana_folder: Aegis
+  - name: aegis-grafana-microsegmentation
+    files:
+      - microsegmentation.json=grafana/dashboards/microsegmentation.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+        app.kubernetes.io/name: aegis-microsegmentation
+        app.kubernetes.io/part-of: aegis-enclave
+        app.kubernetes.io/component: grafana-dashboard
+        aegis.io/module: observability
+      annotations:
+        grafana_folder: Aegis

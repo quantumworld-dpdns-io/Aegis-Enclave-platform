@@ -1,0 +1,313 @@
+# 服務健康與依賴可用性告警規則（跨賽事共用 / CCSP Domain 5）
+#
+# 依賴指標：
+#   契約第 3 節（不得更名）：
+#     aegis_http_requests_total
+#     aegis_kms_encrypt_total / aegis_kms_decrypt_total
+#     aegis_kms_operation_duration_seconds（histogram → _bucket / _count）
+#     aegis_chain_calls_total{method,status}
+#   Prometheus Operator 抓取目標：
+#     up{namespace,service}（由本目錄 ServiceMonitor 產生）
+#   kube-prometheus-stack 內建 kube-state-metrics：
+#     kube_deployment_spec_replicas
+#     kube_deployment_status_replicas_available
+#     kube_pod_container_status_restarts_total
+#
+# 零信任閘道規則（zero-trust-gateway.yaml）的 5xx runbook 會交叉比對
+# AegisServiceDown，因此本檔必須提供同名告警，不可改名。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-service-health
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aegis-service-health
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: alert-rules
+    aegis.io/module: observability
+    prometheus: kube-prometheus-stack-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: aegis.service-health.scrape
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 1. 抓取目標已存在但回報 down
+        #    up 是 Prometheus 對每個 scrape target 自動產生的合成指標。
+        # ------------------------------------------------------------------
+        - alert: AegisServiceDown
+          expr: |
+            up{namespace="aegis", service=~"gateway|dataplane"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+            page: "true"
+          annotations:
+            summary: "{{ $labels.service }} 的 Prometheus 抓取目標已連續失敗"
+            description: >-
+              【發生什麼】命名空間 {{ $labels.namespace }} 的服務 {{ $labels.service }}
+              已被 Prometheus 列為抓取目標，但連續 2 分鐘 up=0。
+              【為什麼重要】指標中斷代表兩件事同時發生：服務可能已經不可用，
+              而且所有依賴該服務指標的安全告警（外洩、驗證失敗、遮罩失效）也會一起失明。
+              零信任閘道的 5xx 排查會先看這條規則，用來判斷是下游掛了還是應用層出錯。
+              【可能原因】(1) Pod 尚未就緒或正在重啟；(2) 指標埠沒在聽
+              （gateway 應為 :9090、dataplane 與業務共用 :8000 /metrics）；
+              (3) Cilium 策略誤擋了 Prometheus 到 aegis namespace 的 scrape；
+              (4) 服務選取器與 Deployment 標籤不一致，endpoints 為空。
+            runbook: >-
+              1. 確認工作負載：kubectl -n aegis get deploy,po,ep {{ $labels.service }}
+              並檢查 READY 與最近事件。
+              2. 直接打指標端點（叢集內）：
+              gateway → curl -sS gateway.aegis.svc.cluster.local:9090/metrics | head
+              dataplane → curl -sS dataplane.aegis.svc.cluster.local:8000/metrics | head
+              3. 若連線被拒，用 Hubble 看 Prometheus → 該 Pod 是否被 DROPPED，
+              必要時請模組 E 為 observability→aegis 的 scrape 補一條放行策略
+              （模組 F 不修改 infra/k8s/）。
+              4. 修復前把此期間標成「該服務無監控」空窗，事後補做稽核回溯。
+
+        # ------------------------------------------------------------------
+        # 2. 預期的抓取目標根本沒出現（ServiceMonitor 未生效）
+        # ------------------------------------------------------------------
+        - alert: AegisServiceTargetMissing
+          expr: |
+            (
+              absent(up{namespace="aegis", service="gateway"}) == 1
+            )
+            or
+            (
+              absent(up{namespace="aegis", service="dataplane"}) == 1
+            )
+          for: 10m
+          labels:
+            severity: critical
+            category: observability-health
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: "Prometheus 找不到 {{ $labels.service }} 的抓取目標"
+            description: >-
+              【發生什麼】連續 10 分鐘查不到 up{namespace="aegis", service="{{ $labels.service }}" }。
+              【為什麼重要】這通常不是應用程式當掉，而是可觀測性管線本身沒接上：
+              ServiceMonitor 沒被 Prometheus Operator 選到、標籤不符、或 CRD 尚未安裝。
+              畫面看起來很乾淨，實際上是「什麼都沒在看」，與 AegisHubbleMetricsAbsent 同一類靜默失效。
+              【可能原因】(1) 尚未 kubectl apply -k infra/observability；
+              (2) kube-prometheus-stack 的 serviceMonitorSelector 仍鎖定 Helm release 標籤；
+              (3) Service 的 app.kubernetes.io/name 被改掉，與 ServiceMonitor selector 脫節；
+              (4) Prometheus Operator CRD 不存在（模組 D 尚未安裝）。
+            runbook: >-
+              1. 確認 CR：kubectl -n observability get servicemonitor,prometheus
+              2. 確認 selector：Prometheus CR 的 serviceMonitorSelector / namespaceSelector
+              必須能選到本目錄的 ServiceMonitor（建議 serviceMonitorSelectorNilUsesHelmValues=false，見 README）。
+              3. 確認 Service 標籤仍為 app.kubernetes.io/name={{ $labels.service }}。
+              4. 修復前不要把「沒有告警」當成系統健康。
+
+        # ------------------------------------------------------------------
+        # 3. gateway 契約指標消失
+        # ------------------------------------------------------------------
+        - alert: AegisGatewayHttpMetricsAbsent
+          expr: |
+            absent(aegis_http_requests_total) == 1
+          for: 10m
+          labels:
+            severity: critical
+            category: observability-health
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: 閘道契約指標 aegis_http_requests_total 已消失
+            description: >-
+              【發生什麼】Prometheus 連續 10 分鐘查不到 CONTRACT.md 第 3 節鎖定的
+              aegis_http_requests_total。
+              【為什麼重要】零信任告警（驗證失敗、授權拒絕、5xx、限流）全部建立在這條 counter 上。
+              指標消失時那些規則會安靜失效，SIEM 總覽也會空白。
+              【可能原因】(1) gateway 尚未實作或更名了契約指標（禁止）；
+              (2) 抓取到的是錯誤的埠（業務埠 8080 沒有 /metrics）；
+              (3) 指標暫存被清空且之後沒有任何請求，series 過期被回收。
+            runbook: >-
+              1. 先看 AegisServiceDown / AegisServiceTargetMissing 是否同時 firing，
+              若是，先修抓取再看本條。
+              2. curl gateway:9090/metrics | grep aegis_http_requests_total
+              確認服務端仍使用契約名稱。
+              3. 若名稱被改，退回 CONTRACT.md 第 3 節，不要改告警來遷就。
+
+        # ------------------------------------------------------------------
+        # 4. dataplane 契約指標消失
+        # ------------------------------------------------------------------
+        - alert: AegisDataplaneKmsMetricsAbsent
+          expr: |
+            absent(aegis_kms_decrypt_total) == 1
+            and
+            absent(aegis_kms_encrypt_total) == 1
+          for: 10m
+          labels:
+            severity: critical
+            category: observability-health
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: 資料面契約指標 aegis_kms_encrypt_total / aegis_kms_decrypt_total 皆消失
+            description: >-
+              【發生什麼】加密與解密兩條主指標同時缺席超過 10 分鐘。
+              【為什麼重要】資料外洩偵測（異常解密速率、加解密比例、遮罩管線）全部依賴它們。
+              只缺其中一條可能只是「這段時間沒有讀或沒有寫」；兩條都沒有才代表埋點或抓取壞了。
+              【可能原因】(1) dataplane 尚未實作契約指標；(2) 抓取路徑不是 /metrics；
+              (3) 服務剛啟動且從未處理過任何加解密請求，series 尚未建立。
+            runbook: >-
+              1. curl dataplane:8000/metrics | grep -E 'aegis_kms_(encrypt|decrypt)_total'
+              2. 若端點 404，確認 FastAPI 已掛載 Prometheus instrumentator 且路徑為 /metrics。
+              3. 用一筆合法的 vault 寫入／讀取催出序列後，再判斷是否仍缺席。
+
+    - name: aegis.service-health.workloads
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 5. Deployment 可用副本不足
+        # ------------------------------------------------------------------
+        - alert: AegisDeploymentReplicasUnavailable
+          expr: |
+            (
+              kube_deployment_status_replicas_available{namespace="aegis", deployment=~"gateway|dataplane"}
+              /
+              clamp_min(
+                kube_deployment_spec_replicas{namespace="aegis", deployment=~"gateway|dataplane"},
+                1
+              )
+            ) < 1
+          for: 5m
+          labels:
+            severity: critical
+            category: availability
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} 可用副本不足（比例 {{ $value | printf \"%.2f\" }}）"
+            description: >-
+              【發生什麼】aegis namespace 的 {{ $labels.deployment }} 可用副本少於期望副本，
+              目前可用比例 {{ $value | printf "%.2f" }}。
+              【為什麼重要】gateway 是唯一對外入口，dataplane 是唯一能解密的元件。
+              任一 Deployment 掉到 0 就緒副本，對應的業務路徑會全面 5xx，
+              也會讓攻擊者看到「服務不穩」而加大探測。
+              【可能原因】(1) 映像拉不到（kind 未 load）；(2) 探針失敗
+              （gateway /healthz /readyz，dataplane /internal/healthz）；
+              (3) 資源 limits 導致 OOMKilled；(4) 近期滾動更新卡住。
+            runbook: >-
+              1. kubectl -n aegis describe deploy/{{ $labels.deployment }}
+              與 kubectl -n aegis logs deploy/{{ $labels.deployment }} --tail=200
+              2. 確認探針路徑仍符合 CONTRACT.md 第 2 節，不要把探針改到需驗證的 API。
+              3. 若為 ImagePullBackOff，執行 make load 把映像重新載入 Kind。
+              4. 交叉比對 AegisServiceDown 與 AegisGateway5xxErrorRateHigh。
+
+        # ------------------------------------------------------------------
+        # 6. 容器反覆重啟
+        # ------------------------------------------------------------------
+        - alert: AegisPodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="aegis", container=~"gateway|dataplane"}[15m]) > 3
+          for: 0m
+          labels:
+            severity: warning
+            category: availability
+            competition: tln
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: "容器 {{ $labels.container }}（Pod {{ $labels.pod }}）15 分鐘重啟 {{ $value | printf \"%.0f\" }} 次"
+            description: >-
+              【發生什麼】aegis namespace 的容器 {{ $labels.container }} 在 15 分鐘內
+              重啟了 {{ $value | printf "%.0f" }} 次。
+              【為什麼重要】反覆重啟會讓進行中的加解密中斷，也會讓 JWT 快取、
+              限流計數器與連線池反覆重建。對資料面而言，若重啟發生在寫入半途，
+              必須確認沒有「加密失敗仍落地明文」的路徑。
+              【可能原因】(1) 存活探針過嚴；(2) OOM；(3) 未處理的 panic / 未捕捉例外；
+              (4) 唯讀根檔案系統加上寫入家目錄失敗（dataplane 必須設 HOME=/tmp）。
+            runbook: >-
+              1. kubectl -n aegis describe pod/{{ $labels.pod }} 看 Last State 與 Reason。
+              2. 若為 OOMKilled，先看是否被攻擊打出資源耗盡；不要急著加 memory limit 掩蓋問題。
+              3. 取出崩潰前日誌，確認沒有把 PII 或金鑰材料印出來。
+              4. 與 AegisDeploymentReplicasUnavailable 一起看，判斷是單 Pod 還是整組。
+
+    - name: aegis.service-health.dependencies
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 7. KMS 呼叫 p99 延遲劣化
+        #    histogram_quantile 必須先 rate(_bucket) 再 sum by (le, ...)，順序不可反。
+        # ------------------------------------------------------------------
+        - alert: AegisKmsOperationLatencyP99Degraded
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, driver, operation) (rate(aegis_kms_operation_duration_seconds_bucket[5m]))
+            ) > 1
+            and
+            sum by (driver, operation) (rate(aegis_kms_operation_duration_seconds_count[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            category: key-management
+            competition: financial-cybersecurity
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: "KMS {{ $labels.operation }}（driver={{ $labels.driver }}）p99 達 {{ $value | printf \"%.3f\" }} 秒"
+            description: >-
+              【發生什麼】driver {{ $labels.driver }} 的 {{ $labels.operation }} 操作
+              p99 延遲為 {{ $value | printf "%.3f" }} 秒，超過 1 秒門檻。
+              【為什麼重要】信封加密的每次讀寫都要碰 KMS。KMS 變慢會直接反映成
+              gateway 的 p99（見 AegisGatewayLatencyP99Degraded），也會讓重試放大，
+              看起來像解密暴增。必須先分清「真的在大量解密」還是「每次解密都在排隊」。
+              【可能原因】(1) LocalStack / Vault / AWS KMS 端點過載或不可達；
+              (2) 網路策略擋住 dataplane → KMS；(3) 金鑰政策評估變慢；
+              (4) 與 AegisKmsErrorRatioHigh 同時出現，代表重試風暴。
+            runbook: >-
+              1. 對照「Aegis / 資料保護」的 KMS 操作延遲與 KMS 操作速率面板。
+              2. 若錯誤率同時升高，改走 AegisKmsErrorRatioHigh 的權限竄改排查。
+              3. 確認 AEGIS_KMS_ENDPOINT / AEGIS_VAULT_ADDR 仍指向叢集內服務。
+              4. 不要為了降低延遲而拿掉 encryption context（契約第 6 節）。
+
+        # ------------------------------------------------------------------
+        # 8. 鏈上呼叫失敗比例過高
+        #    契約只鎖定 status 標籤名、未鎖定枚舉值，因此同時相容
+        #    HTTP 風格 5xx 與語意化 error/fail/timeout。
+        # ------------------------------------------------------------------
+        - alert: AegisChainCallFailureRatioHigh
+          expr: |
+            (
+              sum by (method) (rate(aegis_chain_calls_total{status=~"(?i)(error|fail|timeout|5..)"}[10m]))
+              /
+              clamp_min(sum by (method) (rate(aegis_chain_calls_total[10m])), 0.001)
+            ) > 0.1
+            and
+            sum by (method) (rate(aegis_chain_calls_total[10m])) > 0.01
+          for: 10m
+          labels:
+            severity: warning
+            category: availability
+            competition: climatechain
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: "合約方法 {{ $labels.method }} 失敗比例達 {{ $value | printf \"%.3f\" }}"
+            description: >-
+              【發生什麼】碳權相關合約呼叫 {{ $labels.method }} 過去 10 分鐘的失敗比例為
+              {{ $value | printf "%.3f" }}（門檻 0.1）。
+              【為什麼重要】退役（retire）失敗會讓鏈上狀態與資料面紀錄分叉，
+              後續對帳會把「沒退役成功」誤判成雙花或漏帳。這是金融資產操作的可用性事件。
+              【可能原因】(1) Anvil 未啟動或 AEGIS_CHAIN_RPC_URL 指錯；
+              (2) AEGIS_CARBON_CONTRACT_ADDR 仍是空字串（部署後未回填 ConfigMap）；
+              (3) 合約 revert（額度不足、權限不符）；(4) dataplane 到 anvil 的 egress 被策略擋住。
+            runbook: >-
+              1. kubectl -n aegis logs deploy/dataplane | jq 'select(.event | test("chain"))'
+              取出實際 revert 理由，確認日誌沒有錢包私鑰。
+              2. 確認 ConfigMap aegis-chain 的 carbon-contract-address 已由模組 A 回填。
+              3. 檢查 anvil Service 與 dataplane egress 策略是否放行 :8545。
+              4. 不要重放退役交易除非已確認鏈上未成交，避免雙花。

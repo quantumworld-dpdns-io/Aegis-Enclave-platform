@@ -199,9 +199,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 32Mi
-        # JWT 驗簽公鑰（JWKS）。標記 optional 是為了讓九個模組能平行開發：
-        # 模組 B 的測試金鑰尚未產出時，Pod 仍然排得起來，不會卡住整個部署。
-        # 建立方式見 infra/k8s/README.md 與 secrets.example.yaml。
+        # JWT 驗簽公鑰（JWKS）。Kind/demo 由 jwks.demo.yaml 提供（非正式金鑰）。
+        # optional 保留：正式金鑰尚未掛入時 Pod 仍排得起來；但 /readyz 在金鑰集
+        # 為空時回 503，rollout 會卡住，因此 demo 必須先有這份 Secret。
         - name: jwks
           secret:
             secretName: aegis-gateway-jwks

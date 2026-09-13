@@ -1,5 +1,5 @@
-# 讓 `kubectl apply -k infra/k8s/policies` 也能一次套用。
-# Makefile 走的是 `kubectl apply -f infra/k8s/policies/`，兩種方式等價。
+# 讓 `kubectl apply -k infra/k8s/policies` 一次套用。
+# 不要用 `kubectl apply -f`：目錄裡的本檔會被當成 Kustomization CR 送進 API 而失敗。
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

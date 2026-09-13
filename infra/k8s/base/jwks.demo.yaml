@@ -1,0 +1,34 @@
+# 僅供 Kind/demo，非正式金鑰。
+#
+# 本檔只含 JWT 驗簽用的 RSA 公鑰（JWKS），沒有對應私鑰，也不可當成正式金鑰。
+# 正式環境必須自行產生金鑰材料，且不可把正式金鑰提交到版控。
+#
+# 為什麼預建：gateway /readyz 在 JWKS 為空時回 503。Secret aegis-gateway-jwks
+# 若未建立（optional volume + secrets.example.yaml 不建它），kubelet 探針
+# 會一直失敗，make deploy 與 e2e-kind 的 rollout status 會等滿 180s。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aegis-gateway-jwks
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: jwks
+    app.kubernetes.io/part-of: aegis-enclave
+    aegis.io/purpose: kind-demo-only
+type: Opaque
+stringData:
+  # 掛到 /etc/aegis/jwks.json（見 gateway.yaml 的 AEGIS_JWKS_PATH）。
+  jwks.json: |
+    {
+      "keys": [
+        {
+          "kty": "RSA",
+          "kid": "aegis-kind-demo",
+          "use": "sig",
+          "alg": "RS256",
+          "n": "vpWnp2vf6GxrLLsDCp5gkiLD7crGtqMH8GKIc1aHvnOghhdFQe_7YPqE0bGZC_grDWIp3EgSTXcxnaCBhTbMhCUO8K4ayLoQtWPpLcRkd_y0tTNy09Z5Bwp5cYVCvn1yoljaa90nQuqdvzgLPmshSb1LQMuZqcemZX2uoRY1i3hyd9NQ65FMyUzTdofkt_ckGyKVhD3SFcpB3gT_P1MmSBRYhgHz0XDehJHrt9gpNtT1n9fxklAI3yHxS_NmH82PZHNAAgrneQ9QnHCBgTYvypPi1K5-SHDi0OTNBl2wyyCC2e969O_XyMe_7w6-sYUGklfdOkUcjbDHukva02HicQ",
+          "e": "AQAB"
+        }
+      ]
+    }

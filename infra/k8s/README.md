@@ -6,17 +6,29 @@ Terraform（模組 D）不會建它們。
 
 ## 部署順序
 
-```bash
-# 1. 模組 D 拉起 Kind + Cilium + kube-prometheus-stack
-make up          # 或 terraform apply 後再 make deploy
+先 `make bootstrap` 與 `make doctor`。**不要先自動 `make up`**，它會建立 Kind 叢集並跑 Terraform。
 
-# 2. make deploy 等價於：
+```bash
+# 1. 模組 D 拉起 Kind + Cilium + kube-prometheus-stack（自行決定時機）
+make up          # 或 terraform apply 後再走下面步驟
+
+# 2. 套用本目錄前，JWKS 必須存在。Kind/demo 已內建於 base/jwks.demo.yaml
+#    （僅供 Kind/demo，非正式金鑰）。正式環境請先建立自己的 Secret：
+#    kubectl -n aegis create secret generic aegis-gateway-jwks \
+#      --from-file=jwks.json=path/to/jwks.json
+#    沒有這份 Secret 時 gateway /readyz 回 503，rollout 會等滿 180s。
+
+# 3. make deploy 等價於：
 kubectl apply -k infra/k8s/base
-kubectl apply -f infra/k8s/policies/
+kubectl apply -k infra/k8s/policies
 kubectl -n aegis rollout status deploy/gateway --timeout=180s
 kubectl -n aegis rollout status deploy/dataplane --timeout=180s
 
-# 3. 驗證微分段真的有效（也是 CI e2e-kind 的驗收）
+# 4. 模組 F：Prometheus 規則、ServiceMonitor、Grafana 儀表板
+#    （需要模組 D 已裝好 kube-prometheus-stack）
+kubectl apply -k infra/observability
+
+# 5. 驗證微分段真的有效（也是 CI e2e-kind 的驗收）
 ./scripts/attack-sim/run.sh
 ```
 
@@ -33,7 +45,8 @@ kubectl -n aegis rollout status deploy/dataplane --timeout=180s
 | `localstack.yaml` | 離線 KMS，init 建立 `alias/aegis-master` 與 `alias/aegis-pseudonym` |
 | `vault.yaml` | Transit 備援後端（**dev 模式，僅供展示**） |
 | `anvil.yaml` | Foundry 本地鏈，chainId 31337 |
-| `secrets.example.yaml` | demo 用假值；正式環境改 External Secrets / Vault Agent |
+| `secrets.example.yaml` | demo 用假值（salt / Vault token）；正式環境改 External Secrets / Vault Agent |
+| `jwks.demo.yaml` | Kind/demo 用 JWKS 公鑰 Secret（**僅供 Kind/demo，非正式金鑰**） |
 
 所有容器都套 restricted 等級的 `securityContext`：
 `runAsNonRoot`、`readOnlyRootFilesystem`、`capabilities.drop: [ALL]`、
@@ -76,7 +89,9 @@ make hubble
 # 或：hubble observe --verdict DROPPED --follow
 ```
 
-JWKS 公鑰不在本目錄預建。模組 B 產出後：
+Kind/demo 的 JWKS 公鑰由 `base/jwks.demo.yaml` 預建（**僅供 Kind/demo，非正式金鑰**），
+`kubectl apply -k infra/k8s/base` 會一併建立 `aegis-gateway-jwks`。正式金鑰不可提交；
+正式環境請覆蓋為自行產生的公鑰：
 
 ```bash
 kubectl -n aegis create secret generic aegis-gateway-jwks \

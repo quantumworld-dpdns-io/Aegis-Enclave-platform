@@ -1,0 +1,29 @@
+# dataplane ServiceMonitor
+#
+# 契約第 2 節：業務與指標同埠，Service port 名稱 http、容器埠 8000、路徑 /metrics。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aegis-dataplane
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: dataplane
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: metrics
+    aegis.io/module: observability
+    release: kube-prometheus-stack
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - aegis
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dataplane
+      app.kubernetes.io/component: server
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true

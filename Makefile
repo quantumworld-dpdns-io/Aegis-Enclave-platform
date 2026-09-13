@@ -53,7 +53,7 @@ down: ## 銷毀整座叢集
 .PHONY: deploy
 deploy: ## 部署應用程式與 Cilium 網路策略到既有叢集
 	kubectl apply -k infra/k8s/base
-	kubectl apply -f infra/k8s/policies/
+	kubectl apply -k infra/k8s/policies
 	kubectl -n aegis rollout status deploy/gateway --timeout=180s
 	kubectl -n aegis rollout status deploy/dataplane --timeout=180s
 

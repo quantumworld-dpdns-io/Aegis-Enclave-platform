@@ -25,6 +25,71 @@ check_cmd() {
   fi
 }
 
+# 比較 major.minor，have >= need 則回傳 0。不依賴 GNU sort -V。
+version_ge() {
+  local have="$1" need="$2"
+  local have_major have_minor need_major need_minor
+  have_major="${have%%.*}"
+  have_minor="${have#*.}"
+  have_minor="${have_minor%%.*}"
+  need_major="${need%%.*}"
+  need_minor="${need#*.}"
+  need_minor="${need_minor%%.*}"
+  have_major="${have_major:-0}"
+  have_minor="${have_minor:-0}"
+  need_major="${need_major:-0}"
+  need_minor="${need_minor:-0}"
+  if [ "$have_major" -gt "$need_major" ]; then
+    return 0
+  fi
+  if [ "$have_major" -eq "$need_major" ] && [ "$have_minor" -ge "$need_minor" ]; then
+    return 0
+  fi
+  return 1
+}
+
+check_go() {
+  if ! command -v go >/dev/null 2>&1; then
+    bad "go —— 請安裝 Go 1.23 以上"
+    return
+  fi
+  local raw ver
+  raw="$(go version 2>/dev/null || true)"
+  ver="$(printf '%s' "$raw" | sed -n 's/.*go\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+  if [ -z "$ver" ]; then
+    bad "go —— 無法解析版本（${raw}），請安裝 Go 1.23 以上"
+    return
+  fi
+  if version_ge "$ver" "1.23"; then
+    ok "go ${ver}（1.23 以上）"
+  else
+    bad "go ${ver} —— 需要 Go 1.23 以上"
+  fi
+}
+
+check_python() {
+  local cmd="" raw ver
+  if command -v python3 >/dev/null 2>&1; then
+    cmd="python3"
+  elif command -v python >/dev/null 2>&1; then
+    cmd="python"
+  else
+    bad "python —— 請安裝 Python 3.12 以上"
+    return
+  fi
+  raw="$("$cmd" --version 2>&1 || true)"
+  ver="$(printf '%s' "$raw" | sed -n 's/.*[Pp]ython \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+  if [ -z "$ver" ]; then
+    bad "python —— 無法解析版本（${raw}），請安裝 Python 3.12 以上"
+    return
+  fi
+  if version_ge "$ver" "3.12"; then
+    ok "python ${ver}（3.12 以上）"
+  else
+    bad "python ${ver} —— 需要 Python 3.12 以上"
+  fi
+}
+
 echo ""
 echo "Aegis-Enclave 環境檢查"
 echo "======================"
@@ -35,7 +100,8 @@ check_cmd kind      "執行 make bootstrap"
 check_cmd kubectl   "執行 make bootstrap"
 check_cmd helm      "執行 make bootstrap"
 check_cmd terraform "執行 make bootstrap"
-check_cmd go        "請安裝 Go 1.22 以上"
+check_go
+check_python
 check_cmd uv        "執行 make bootstrap"
 check_cmd forge     "執行 make bootstrap，並確認 ~/.foundry/bin 在 PATH 中"
 

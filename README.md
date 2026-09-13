@@ -56,36 +56,65 @@ flowchart TB
 
 ---
 
-## 七個模組：職責、賽事與 CCSP Domain 對照
+## 九個模組：職責、賽事與 CCSP Domain 對照
+
+契約第 8 節的路徑所有權對應九塊已落地的範圍（A–G + CI + 骨架）。狀態以倉庫現況為準，不是骨架。
 
 | 模組 | 路徑 | 核心職責 | 對應賽事 | CCSP Domain | 狀態 |
 | --- | --- | --- | --- | --- | --- |
-| **A 合約** | `contracts/` | ERC-1155 碳權批次代幣 `CarbonCredit.sol` 與 `RetirementRegistry.sol`（退役防雙花）。Foundry unit / fuzz / invariant 測試 + `forge coverage`，Slither 產 SARIF 上傳 GitHub Code Scanning | IEEE ClimateChain | **D4** 雲端應用程式安全 | 開發中 |
-| **B 閘道** | `services/gateway/` | Go + Gin。middleware 鏈：mTLS 驗證 → JWT/SBT 持有證明 → OPA/Rego 授權決策 → 每 subject 限流 → OTel trace 注入。多階段建置為 distroless 非 root 映像 | TLN、ForgeHacks | **D5** 雲端安全營運 | 開發中 |
-| **C 資料面** | `services/dataplane/` | Python + FastAPI。可插拔 `KeyProvider` 介面搭配信封加密（KMS 產 DEK、本地 AES-256-GCM 加密資料、只落地加密後的 DEK），以及 HMAC-SHA256 決定論 PII tokenization | Financial Cybersecurity Challenge | **D2** 雲端資料安全 | 開發中 |
-| **D 基礎設施** | `infra/terraform/` | `tehcyx/kind` provider 一鍵拉起 `disableDefaultCNI` 叢集（pin `node_image`），helm provider 安裝 Cilium 與 kube-prometheus-stack，輸出 kubeconfig | HackTitan | **D3** 雲端平台與基礎設施安全 | 開發中 |
-| **E 網路策略** | `infra/k8s/` | 預設全拒絕的 `CiliumNetworkPolicy` 逐條開放；L7 規則限制 gateway 只能打 dataplane 的特定 method + path。`scripts/attack-sim/` 起惡意 Pod 實證攔截 | HackTitan、ForgeHacks | **D3** 雲端平台與基礎設施安全 | 開發中 |
-| **F 可觀測性** | `infra/observability/` | 雙語言 OTel 埋點 → Prometheus。PromQL 告警涵蓋異常解密速率（資料外洩）、遮罩失效、微分段阻擋；Grafana SIEM 儀表板 | Financial Cybersecurity、TLN | **D5** 雲端安全營運 | 開發中 |
-| **G 文件與敘事** | `docs/`、`scripts/demo-*.sh` | STRIDE 威脅建模、CCSP 控制項對照表、ADR、五份賽事專屬 demo 腳本 | TLN、全賽事評審材料 | **D1–D5** 治理與稽核 | 開發中 |
+| **A 合約** | `contracts/` | ERC-1155 碳權批次代幣 `CarbonCredit.sol` 與 `RetirementRegistry.sol`（退役防雙花）。Foundry unit / fuzz / invariant 測試 + `forge coverage`，Slither 產 SARIF 上傳 GitHub Code Scanning | IEEE ClimateChain | **D4** 雲端應用程式安全 | 已落地 |
+| **B 閘道** | `services/gateway/` | Go + Gin。middleware 鏈：mTLS 驗證 → JWT/SBT 持有證明 → OPA/Rego 授權決策 → 每 subject 限流 → OTel 指標。多階段建置為 distroless 非 root 映像 | TLN、ForgeHacks | **D5** 雲端安全營運 | 已落地 |
+| **C 資料面** | `services/dataplane/` | Python + FastAPI。可插拔 `KeyProvider` 介面搭配信封加密（KMS 產 DEK、本地 AES-256-GCM 加密資料、只落地加密後的 DEK），以及 HMAC-SHA256 決定論 PII tokenization | Financial Cybersecurity Challenge | **D2** 雲端資料安全 | 已落地 |
+| **D 基礎設施** | `infra/terraform/` | `tehcyx/kind` provider 一鍵拉起 `disableDefaultCNI` 叢集（pin `node_image`），helm provider 安裝 Cilium 與 kube-prometheus-stack，輸出 kubeconfig | HackTitan | **D3** 雲端平台與基礎設施安全 | 已落地 |
+| **E 網路策略** | `infra/k8s/` | 預設全拒絕的 `CiliumNetworkPolicy` 逐條開放；L7 規則限制 gateway 只能打 dataplane 的特定 method + path。`scripts/attack-sim/` 起惡意 Pod 實證攔截 | HackTitan、ForgeHacks | **D3** 雲端平台與基礎設施安全 | 已落地 |
+| **F 可觀測性** | `infra/observability/` | PrometheusRule / ServiceMonitor / Grafana SIEM 儀表板。告警涵蓋異常解密速率（資料外洩）、遮罩失效、微分段阻擋 | Financial Cybersecurity、TLN | **D5** 雲端安全營運 | 已落地 |
+| **G 文件與敘事** | `docs/`、`scripts/demo-*.sh` | STRIDE 威脅建模、CCSP 控制項對照表、ADR、五份賽事專屬 demo 腳本 | TLN、全賽事評審材料 | **D1–D5** 治理與稽核 | 已落地 |
+| **CI** | `.github/workflows/` | 五條必過閘門：`contracts`、`gateway-go`、`dataplane-py`、`iac`、`e2e-kind` | 全賽事供應鏈 | **D5** 雲端安全營運 | 已落地 |
+| **骨架** | `Makefile`、`scripts/bootstrap.sh`、`scripts/doctor.sh` | 唯一操作入口：工具鏈安裝、環境健檢、映像／叢集／測試／掃描 | 全賽事 | **D1** 治理與可重現操作 | 已落地 |
 
-> **一魚多吃的關鍵**不是共用程式碼，而是把差異化收斂到 demo 敘事層：七個模組共用同一組服務與同一座叢集，每場比賽只更換 `scripts/demo-<賽事>.sh` 與 `docs/demo/<賽事>.md`。程式碼零重寫，評審看到的故事完全不同。
+> **一魚多吃的關鍵**不是共用程式碼，而是把差異化收斂到 demo 敘事層：應用與叢集共用同一座 Kind，每場比賽只更換 `scripts/demo-<賽事>.sh` 與 `docs/demo/<賽事>.md`。程式碼零重寫，評審看到的故事完全不同。
 >
-> 目前已完成的是**專案骨架與跨模組介面契約**（`docs/CONTRACT.md`）；七個模組正在依契約平行開發中。
+> 跨模組介面仍以 [`docs/CONTRACT.md`](docs/CONTRACT.md) 為準；九個模組的實作已依契約落地。
 
 ---
 
-## Quick Start
+## 快速開始
 
-**前置需求**：macOS 或 Linux、Homebrew、Docker Desktop（建議配置 4 核 CPU 與 8 GB 記憶體以上）、Go 1.23。
+**前置需求**：macOS 或 Linux、Homebrew、Docker Desktop（建議配置 4 核 CPU 與 8 GB 記憶體以上）、Go 1.23 以上、Python 3.12 以上。
+
+先確認工具鏈，**不要先自動執行 `make up`**——它會建立 Kind 叢集並跑 `terraform apply`。
 
 ```bash
 make bootstrap    # 安裝缺少的工具鏈（kind / helm / cilium / hubble / terraform / foundry / uv）
 make doctor       # 檢查本機是否具備執行條件，並提示 macOS 的 eBPF 限制
-make up           # 建置映像 → terraform apply 拉起叢集 → 部署應用與網路策略
-make demo-tln     # 執行 TLN 賽事的展示流程（零信任攔截 + SIEM 日誌審計）
 ```
 
 `make bootstrap` 是 idempotent 的，重複執行只會略過已安裝的工具。Trivy 與 Slither 刻意不裝在本機，而是透過官方 Docker 映像執行，好處是掃描器版本與 CI 完全一致，也不會在開發機累積 Python 相依衝突。
+
+`make doctor` 通過後，再依需要拉起叢集。**先有 JWKS，再 deploy**：Kind/demo 的驗簽公鑰由 [`infra/k8s/base/jwks.demo.yaml`](infra/k8s/base/jwks.demo.yaml) 提供（**僅供 Kind/demo，非正式金鑰**），`kubectl apply -k infra/k8s/base` 會一併建立。沒有 `aegis-gateway-jwks` 時 gateway `/readyz` 回 503，`make deploy` 會等滿 180s。正式金鑰請自行建立，不可提交。
+
+```bash
+# 自行決定時機：建置映像 → terraform apply 拉起叢集 → 部署應用與網路策略
+make up
+
+# 若叢集已在：確認 JWKS 後再部署（demo Secret 已含在 kustomize base）
+make deploy
+
+# 模組 F：Prometheus 規則、ServiceMonitor、Grafana 儀表板
+# （需要模組 D 已裝好 kube-prometheus-stack）
+kubectl apply -k infra/observability
+
+make demo-tln     # 執行 TLN 賽事的展示流程（零信任攔截 + SIEM 日誌審計）
+```
+
+正式環境覆蓋 JWKS：
+
+```bash
+kubectl -n aegis create secret generic aegis-gateway-jwks \
+  --from-file=jwks.json=path/to/jwks.json
+```
+
+細節見 [`infra/k8s/README.md`](infra/k8s/README.md) 與 [`infra/observability/README.md`](infra/observability/README.md)。
 
 **其他常用指令**（完整清單執行 `make help`）：
 
@@ -98,6 +127,49 @@ make demo-tln     # 執行 TLN 賽事的展示流程（零信任攔截 + SIEM �
 | `make down` | 銷毀整座叢集 |
 
 五場賽事各有獨立入口：`demo-tln`、`demo-fincyber`、`demo-forgehacks`、`demo-climatechain`、`demo-hacktitan`。
+
+### 用 gh 建立 remote 與 branch protection
+
+下列指令只寫在文件裡，**不要自動執行**。有 GitHub 帳號與 `gh auth login` 之後再自行跑。
+
+```bash
+# 1. 以目前目錄建立 GitHub repo，設定 origin，並推送既有 commit
+gh repo create Aegis-Enclave --private --source=. --remote=origin --push
+
+# 2. 鎖定 default branch 的保護規則：五條 CI 必過、至少 1 位審查、禁止 force push
+OWNER_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
+
+gh api --method PUT \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "repos/${OWNER_REPO}/branches/${DEFAULT_BRANCH}/protection" \
+  --input - <<'EOF'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "contracts",
+      "gateway-go",
+      "dataplane-py",
+      "iac",
+      "e2e-kind"
+    ]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": true
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": true,
+  "required_conversation_resolution": true
+}
+EOF
+```
 
 ---
 
@@ -151,9 +223,10 @@ Aegis-Enclave/
 │   ├── terraform/                    # 模組 D：Kind 叢集 + Helm releases
 │   │   └── modules/{kind-cluster,cilium,observability}/
 │   ├── k8s/                          # 模組 E：Kustomize base + CiliumNetworkPolicy
-│   │   └── base/  policies/
-│   └── observability/                # 模組 F：Prometheus 規則 + Grafana 儀表板
-│       ├── prometheus/rules/
+│   │   └── base/  policies/          # base 含 jwks.demo.yaml（僅供 Kind/demo）
+│   └── observability/                # 模組 F：kubectl apply -k infra/observability
+│       ├── kustomization.yaml
+│       ├── prometheus/{rules,servicemonitors}/
 │       └── grafana/dashboards/
 ├── scripts/
 │   ├── bootstrap.sh                  # 安裝工具鏈（idempotent）
@@ -170,7 +243,7 @@ Aegis-Enclave/
 
 ## 跨模組介面契約
 
-七個模組由不同人平行開發，唯一的協調機制是 [`docs/CONTRACT.md`](docs/CONTRACT.md) —— 它定義了版本號、服務端點與埠、Prometheus 指標名稱與標籤、稽核日誌欄位、環境變數、密文信封格式、合約 ABI，以及**路徑所有權**。只要所有人遵守契約就不需要互相等待；反過來說，修改契約前必須先確認不會破壞其他模組。所有自訂指標一律以 `aegis_` 為前綴，服務端不得擅自更名，因為模組 F 的告警規則與儀表板直接依賴這些名稱。
+九個模組由不同人平行開發，唯一的協調機制是 [`docs/CONTRACT.md`](docs/CONTRACT.md) —— 它定義了版本號、服務端點與埠、Prometheus 指標名稱與標籤、稽核日誌欄位、環境變數、密文信封格式、合約 ABI，以及**路徑所有權**。只要所有人遵守契約就不需要互相等待；反過來說，修改契約前必須先確認不會破壞其他模組。所有自訂指標一律以 `aegis_` 為前綴，服務端不得擅自更名，因為模組 F 的告警規則與儀表板直接依賴這些名稱。
 
 ---
 
@@ -180,7 +253,7 @@ Aegis-Enclave/
 - **`tehcyx/kind` provider 落後上游**：provider 目前支援到 kind 0.31，上游已是 0.33。因此 `kind_cluster` 明確 pin `node_image` 為 `kindest/node:v1.31.0`，不依賴 provider 預設值。
 - **LocalStack KMS 不等於生產級 KMS**：預設 driver 為 LocalStack，目的是讓整套流程完全免費且可離線 demo，但它不是 FIPS 140 驗證的 HSM，也不提供真實的金鑰輪替稽核軌跡。生產情境應切換 `AEGIS_KMS_DRIVER=aws` 或 `vault`。
 - **鏈上部分僅限本地**：合約部署在 Anvil（chainId 31337），沒有測試網或主網部署；因此 gas 成本與 MEV 相關的攻擊面不在本專案的驗證範圍內。
-- **開發階段**：骨架與介面契約已完成，七個模組仍在平行開發中，`make up` 需要各模組的實作到位後才能完整跑通。
+- **本機叢集是手動步驟**：九個模組已落地，但 `make up` 會建立 Kind 叢集並跑 Terraform，請先 `make bootstrap` → `make doctor`，確認後再自行執行。部署前須有 JWKS（demo 已內建；正式金鑰不可提交），應用起來後再 `kubectl apply -k infra/observability`。
 
 ---
 

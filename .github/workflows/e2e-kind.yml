@@ -145,8 +145,11 @@ jobs:
       - name: 部署應用與網路策略
         run: |
           set -euo pipefail
+          # base 含 jwks.demo.yaml（僅供 Kind/demo，非正式金鑰）。
+          # 沒有 aegis-gateway-jwks 時 gateway /readyz 回 503，rollout 會等滿 180s。
           kubectl apply -k infra/k8s/base
-          kubectl apply -f infra/k8s/policies/
+          kubectl apply -k infra/k8s/policies
+          kubectl -n aegis get secret aegis-gateway-jwks
           kubectl -n aegis rollout status deploy/gateway --timeout=180s
           kubectl -n aegis rollout status deploy/dataplane --timeout=180s
 

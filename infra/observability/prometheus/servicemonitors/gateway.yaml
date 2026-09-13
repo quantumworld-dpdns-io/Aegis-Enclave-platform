@@ -1,0 +1,31 @@
+# gateway ServiceMonitor
+#
+# 契約第 2 節：指標埠名稱 metrics、容器埠 9090、路徑 /metrics。
+# 本資源放在 observability，用 namespaceSelector 指向 aegis，
+# 避免模組 F 去改 infra/k8s/ 的 Service。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aegis-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: metrics
+    aegis.io/module: observability
+    release: kube-prometheus-stack
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - aegis
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+      app.kubernetes.io/component: server
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
