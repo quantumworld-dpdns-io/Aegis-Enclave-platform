@@ -1,0 +1,274 @@
+# 微分段與網路層告警規則（HackTitan 主軸：Cilium 微分段觀測 / CCSP Domain 5）
+#
+# 依賴指標（Cilium Hubble，已由模組 D/E 開啟 drop、flow、http 三組 metrics）：
+#   hubble_drop_total
+#   hubble_flows_processed_total
+#   hubble_http_requests_total
+#
+# ⚠ 標籤相容性說明（協調者請注意）：
+#   Hubble 的來源／目的標籤名稱取決於 Cilium 的 hubble.metrics 設定：
+#     - sourceContext=pod / destinationContext=pod  → 產生 source / destination
+#       （值形如 "aegis/gateway-xxxx"，含 namespace 前綴）
+#     - labelsContext=source_namespace,destination_namespace
+#       → 額外產生 source_namespace / destination_namespace
+#   本檔的規則刻意寫成同時相容兩種設定：
+#     (a) 分群一律用 sum by (source, destination, ...)。若這些標籤不存在，
+#         PromQL 不會報錯，只會退化成單一無標籤序列，規則仍可運作。
+#     (b) 需要指定 namespace 的地方用 `A or B` 覆蓋兩種標籤命名，
+#         哪一種存在就由哪一種生效。
+#   drop reason 的字串在不同 Cilium 版本間有 "Policy denied" 與 "POLICY_DENIED" 兩種寫法，
+#   因此一律用不分大小寫的正規表達式 (?i).*polic.*denied.* 比對。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-microsegmentation
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: aegis-microsegmentation
+    app.kubernetes.io/part-of: aegis-enclave
+    app.kubernetes.io/component: alert-rules
+    aegis.io/module: observability
+    prometheus: kube-prometheus-stack-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: aegis.microsegmentation.l3l4
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 1. Cilium 策略拒絕事件突增（依來源與目的分群）
+        #    策略拒絕代表微分段正在生效攔截；少量是常態，突增則是有人在敲門。
+        # ------------------------------------------------------------------
+        - alert: AegisCiliumPolicyDropSpike
+          expr: |
+            sum by (source, destination, reason) (
+              rate(hubble_drop_total{reason=~"(?i).*polic.*denied.*"}[5m])
+            ) > 0.1
+          for: 2m
+          labels:
+            severity: warning
+            category: microsegmentation
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: Cilium 策略拒絕突增：{{ $labels.source }} → {{ $labels.destination }}
+            description: >-
+              【發生什麼】從 {{ $labels.source }} 到 {{ $labels.destination }} 的連線
+              以 {{ $value | printf "%.2f" }} 次/秒的速率被 Cilium 網路策略拒絕，
+              拒絕原因為 {{ $labels.reason }}。
+              【為什麼重要】這是微分段控制「正在生效」的直接證據，也是橫向移動嘗試的訊號。
+              零信任的網路層假設是「預設拒絕」，所以每一筆策略拒絕都代表有工作負載
+              試圖建立未經授權的連線。持續的拒絕不是雜訊，是有東西在敲不該敲的門。
+              【可能原因】(1) 攻擊者或攻擊模擬在嘗試橫向移動；
+              (2) 新部署的工作負載缺少對應的 CiliumNetworkPolicy（設定缺漏）；
+              (3) 應用程式嘗試連線未登錄的外部依賴；(4) 服務發現快取過期後連到舊 Pod IP。
+            runbook: >-
+              1. 用 Hubble 看實際流量而不只是計數：
+              hubble observe --verdict DROPPED --from-pod {{ $labels.source }} --last 200
+              取得完整的 L3/L4 與（若有）L7 細節。
+              2. 判斷方向性：如果來源是 aegis namespace 內的合法服務，優先當作策略缺漏處理，
+              檢查 infra/k8s/policies/ 是否遺漏該路徑。
+              3. 如果來源是 attacker namespace 或未知工作負載，視為攻擊，
+              交叉比對 AegisAttackerNamespaceTrafficDetected。
+              4. 切記：不要為了讓告警消失就放寬策略。先確認該連線是否真的必要。
+              5. 在「Aegis / 微分段」儀表板的策略拒絕熱點面板截圖，作為微分段有效性的 demo 證據。
+
+        # ------------------------------------------------------------------
+        # 2. attacker namespace 的流量一出現就告警（零容忍）
+        #    attacker namespace 依 CONTRACT.md 第 1 節專供攻擊模擬使用，
+        #    它發出的任何流量在生產語意上都是敵對流量。
+        #    expr 用 `or` 同時覆蓋 labelsContext 與 podContext 兩種標籤命名。
+        # ------------------------------------------------------------------
+        - alert: AegisAttackerNamespaceTrafficDetected
+          expr: |
+            (
+              sum by (destination) (
+                rate(hubble_flows_processed_total{source_namespace="attacker"}[2m])
+              ) > 0
+            )
+            or
+            (
+              sum by (destination) (
+                rate(hubble_flows_processed_total{source=~"attacker/.*"}[2m])
+              ) > 0
+            )
+          for: 0m
+          labels:
+            severity: critical
+            category: microsegmentation
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 偵測到來自 attacker 命名空間的流量，目的為 {{ $labels.destination }}
+            description: >-
+              【發生什麼】attacker 命名空間中的工作負載正在對 {{ $labels.destination }} 發送流量，
+              速率 {{ $value | printf "%.2f" }} 次/秒。
+              【為什麼重要】attacker 命名空間是專門用於攻擊模擬的隔離區，
+              正常營運下不應有任何流量從這裡流出。因此這條規則採零容忍設計（for: 0m）：
+              只要有流量就告警。在 demo 情境下，這條告警亮起正是微分段偵測能力的證明；
+              在真實環境中，等價的訊號是「不該互通的命名空間之間出現流量」。
+              【可能原因】(1) 攻擊模擬腳本正在執行（demo 的預期行為）；
+              (2) 真實的橫向移動嘗試；(3) 有人誤把測試工作負載部署到 attacker namespace。
+            runbook: >-
+              1. 先確認是否為預期的 demo：檢查 scripts/attack-sim/ 是否正在執行。
+              若是，觀察後續的 AegisCiliumPolicyDropSpike 是否同步亮起，
+              兩者一起出現才代表「偵測 + 攔截」都有效。
+              2. 若非預期，立即用 Hubble 確認攻擊是否成功穿透：
+              hubble observe --namespace attacker --last 500
+              重點看 verdict 是 DROPPED（策略有效）還是 FORWARDED（策略有缺口）。
+              3. 若出現 FORWARDED，那是微分段的實質缺口，必須立刻補上
+              infra/k8s/policies/ 中對應的拒絕規則，並檢查 aegis namespace 內是否已有落地跡象。
+              4. 確認 gateway 端是否同時出現 AegisAuthnMissingCredentialSpike，
+              以判斷攻擊者是否已進到應用層。
+
+        # ------------------------------------------------------------------
+        # 3. 整體流量的拒絕比例過高
+        #    宏觀指標：用來抓「策略設定大範圍出錯」或「大規模掃描」。
+        # ------------------------------------------------------------------
+        - alert: AegisNetworkDropRatioHigh
+          expr: |
+            (
+              sum(rate(hubble_drop_total[5m]))
+              /
+              clamp_min(sum(rate(hubble_flows_processed_total[5m])), 0.001)
+            ) > 0.05
+            and
+            sum(rate(hubble_flows_processed_total[5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+            category: microsegmentation
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: 叢集網路丟棄比例達 {{ $value | printf "%.3f" }}
+            description: >-
+              【發生什麼】過去 5 分鐘，被丟棄的流量占已處理流量的比例為
+              {{ $value | printf "%.3f" }}（門檻 0.05），且整體流量足夠有統計意義。
+              【為什麼重要】健康的叢集丟棄比例應接近於零。比例上升的兩種可能後果相反：
+              若是策略誤設，正常服務間通訊會斷線（可用性事件）；
+              若是掃描攻擊，代表有大量探測流量正在被攔截（安全事件）。
+              【可能原因】(1) 新部署的 CiliumNetworkPolicy 過於嚴格，誤擋合法流量；
+              (2) 大規模的網路掃描；(3) Pod IP 變動後的殘留連線；(4) 節點層網路故障。
+            runbook: >-
+              1. 先看丟棄原因的分布：sum by (reason) (rate(hubble_drop_total[5m]))
+              若以策略拒絕為主 → 策略問題或攻擊；若以其他原因為主 → 偏向基礎網路故障。
+              2. 若判定為策略誤設，用 hubble observe --verdict DROPPED 找出被誤擋的來源／目的配對，
+              再回頭補 infra/k8s/policies/。
+              3. 若判定為掃描，交叉比對 attacker namespace 告警與 gateway 的探測告警。
+
+        # ------------------------------------------------------------------
+        # 4. Hubble 指標消失（可觀測性自我監控）
+        #    如果 Hubble 沒在吐指標，上面三條規則會安靜地失效，
+        #    那比沒有告警更危險——你會誤以為網路是乾淨的。
+        # ------------------------------------------------------------------
+        - alert: AegisHubbleMetricsAbsent
+          expr: |
+            absent(hubble_flows_processed_total) == 1
+          for: 10m
+          labels:
+            severity: critical
+            category: observability-health
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: platform
+          annotations:
+            summary: Hubble 流量指標消失，微分段可觀測性已失效
+            description: >-
+              【發生什麼】Prometheus 已連續 10 分鐘查不到 hubble_flows_processed_total 這個指標。
+              【為什麼重要】這是所有網路層告警的共同前提。指標消失時，
+              策略拒絕與 attacker 流量的告警都會安靜地停止運作，
+              監控畫面看起來一片乾淨，但實際上是「什麼都沒在看」。
+              這種「靜默失效」比明確的告警更危險，因此本身列為 critical。
+              【可能原因】(1) Cilium Agent 的 hubble.metrics 設定被關閉或改動；
+              (2) hubble-metrics Service 的 ServiceMonitor 遺失或選擇器不符；
+              (3) Cilium Agent Pod 異常；(4) Prometheus 端的抓取設定被覆寫。
+            runbook: >-
+              1. 確認 Cilium Agent 存活與 Hubble 是否啟用：
+              cilium status --wait 並檢查 Hubble 一節是否為 OK。
+              2. 直接驗證 metrics 端點有在吐資料：
+              kubectl -n kube-system port-forward ds/cilium 9965:9965 然後 curl localhost:9965/metrics | head
+              3. 確認 Prometheus 的 Targets 頁面中 Hubble 的抓取目標狀態為 UP。
+              4. 修復前把此期間視為「網路層無監控」的空窗，事後需補做流量回溯審計。
+
+    - name: aegis.microsegmentation.l7
+      interval: 30s
+      rules:
+        # ------------------------------------------------------------------
+        # 5. L7 HTTP 403 拒絕（Envoy 攔截未授權路徑）
+        #    依 CONTRACT.md 第 2 節，Cilium L7 policy 只放行
+        #    /internal/v1/* 與 /internal/healthz；其餘路徑（如 /internal/v1/keys、/docs）
+        #    會被 Envoy 直接以 403 攔下，這正是微分段 demo 的攔截目標。
+        # ------------------------------------------------------------------
+        - alert: AegisL7PolicyForbiddenSpike
+          expr: |
+            sum by (method, status) (rate(hubble_http_requests_total{status=~"403"}[5m])) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            category: microsegmentation-l7
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: L7 策略攔截 HTTP {{ $labels.method }} 請求（403，{{ $value | printf "%.2f" }} 次/秒）
+            description: >-
+              【發生什麼】Cilium 的 L7（Envoy）過濾器以 HTTP 403 拒絕了
+              {{ $labels.method }} 方法的請求，速率 {{ $value | printf "%.2f" }} 次/秒。
+              【為什麼重要】L7 拒絕比 L3/L4 拒絕的訊號更強。L4 拒絕只說明「連線目標不對」，
+              而 L7 403 說明「連線目標是對的、TCP 也通了，但請求的 HTTP 路徑不在放行清單內」。
+              換句話說，對方已經能碰到 dataplane，正在嘗試存取未授權的端點
+              （例如 /internal/v1/keys 這種會洩漏金鑰材料的路徑）。這是深度防禦的最後一道網路關卡。
+              【可能原因】(1) 攻擊者已進入叢集並探測 dataplane 的內部 API；
+              (2) gateway 版本升級後呼叫了尚未加入 L7 放行清單的新路徑（設定缺漏）；
+              (3) 有人嘗試存取 FastAPI 的 /docs 或 /openapi.json 以取得 API 結構。
+            runbook: >-
+              1. 立刻確認被拒的實際路徑，這是判斷意圖的唯一依據：
+              hubble observe --protocol http --last 200 -o json | jq 'select(.l7.http.code==403)'
+              重點看 http.url 與來源 Pod。
+              2. 如果被拒路徑是 /internal/v1/keys 或任何金鑰相關端點，
+              視為針對金鑰材料的攻擊，最高優先處理，並確認該端點在 dataplane 中確實不存在或已停用。
+              3. 如果來源是 gateway 自己，那是我方的設定缺漏：確認新路徑是否應加入
+              CONTRACT.md 第 2 節的放行清單（需與模組 C、E 協調，不可單方面放寬）。
+              4. 如果來源是 attacker namespace，這是 demo 的預期攔截，
+              在「Aegis / 微分段」儀表板的 L7 放行／拒絕比例面板留存畫面。
+              5. 絕對不要為了消除告警而放寬 L7 白名單。這條清單是微分段的核心價值。
+
+        # ------------------------------------------------------------------
+        # 6. L7 拒絕占比過高（L7 策略誤設或大規模路徑列舉）
+        # ------------------------------------------------------------------
+        - alert: AegisL7ForbiddenRatioHigh
+          expr: |
+            (
+              sum(rate(hubble_http_requests_total{status=~"403"}[10m]))
+              /
+              clamp_min(sum(rate(hubble_http_requests_total[10m])), 0.001)
+            ) > 0.2
+            and
+            sum(rate(hubble_http_requests_total[10m])) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+            category: microsegmentation-l7
+            competition: hacktitan
+            ccsp_domain: "5"
+            team: soc
+          annotations:
+            summary: L7 流量中有 {{ $value | printf "%.3f" }} 比例被以 403 拒絕
+            description: >-
+              【發生什麼】過去 10 分鐘，L7 層被拒絕的 HTTP 請求占總請求的比例為
+              {{ $value | printf "%.3f" }}（門檻 0.2）。
+              【為什麼重要】單筆 403 可能是誤觸，但超過兩成的請求被拒代表系統性問題：
+              要嘛 L7 白名單與實際 API 已經脫節（會造成服務中斷），
+              要嘛有人在系統性地列舉 dataplane 的內部路徑。
+              【可能原因】(1) 服務端新增 API 路徑但未同步 L7 policy；
+              (2) 自動化的路徑列舉掃描；(3) L7 policy 部署時的路徑正規表達式寫錯。
+            runbook: >-
+              1. 統計被拒路徑的種類數：路徑種類少而集中 → 偏向白名單脫節；
+              路徑種類多而分散 → 偏向列舉掃描。
+              2. 若為白名單脫節，比對 CONTRACT.md 第 2 節的內部路由清單與實際 L7 policy，
+              並向模組 E 提出更新請求（模組 F 不修改 infra/k8s/）。
+              3. 若為列舉掃描，走 AegisL7PolicyForbiddenSpike 的處置流程。

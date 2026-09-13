@@ -1,0 +1,70 @@
+# Aegis-Enclave 版本控制屬性
+#
+# 兩個主要目的：
+#   1. 行尾正規化 —— shell 腳本與容器內執行的檔案若被寫入 CRLF，Linux 的
+#      shebang 解析會失敗（錯誤訊息是難以理解的 "bad interpreter: No such file"）。
+#      在 macOS 開發、Linux 容器執行的組合下，這是最常見的隱性故障。
+#   2. 語言統計與 diff 降噪 —— vendored 相依與產生物不應影響 GitHub 語言比例，
+#      也不該在 code review 中出現。
+
+# 預設讓 git 自行判斷是否為文字檔並正規化為 LF。
+* text=auto eol=lf
+
+# --- 強制 LF：這些檔案會直接在 Linux 容器 / CI runner 中被執行 ---
+*.sh          text eol=lf
+*.bash        text eol=lf
+Makefile      text eol=lf
+*.mk          text eol=lf
+Dockerfile    text eol=lf
+Dockerfile.*  text eol=lf
+*.dockerfile  text eol=lf
+.env.example  text eol=lf
+scripts/**    text eol=lf
+
+# --- 原始碼（明確標記為文字，避免被誤判為二進位）---
+*.go   text eol=lf
+*.py   text eol=lf
+*.sol  text eol=lf
+*.tf   text eol=lf
+*.tfvars text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.rego text eol=lf
+
+# --- 二進位：禁止行尾轉換與文字 diff ---
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+
+# --- 憑證與金鑰材料：即使是測試用假憑證也不做行尾轉換，避免破壞 PEM 結構 ---
+*.pem  -text
+*.crt  -text
+*.key  -text
+
+# --- Vendored：Foundry 以 git submodule 形式安裝相依到 contracts/lib ---
+# 標記為 vendored 後，GitHub 不計入語言統計、PR diff 預設折疊，
+# 且 CodeQL / linguist 不會對第三方合約（forge-std、OpenZeppelin）報告問題。
+contracts/lib/** linguist-vendored
+
+# --- 產生物：不計入語言統計，也不需要人工審閱 ---
+contracts/out/**        linguist-generated
+contracts/cache/**      linguist-generated
+contracts/broadcast/**  linguist-generated
+lcov.info               linguist-generated -diff
+uv.lock                 linguist-generated -diff
+go.sum                  linguist-generated -diff
+infra/observability/grafana/dashboards/*.json linguist-generated
+
+# --- 文件：讓 GitHub 正確標記語言（docs 是本專案的評審材料，不應被視為程式碼）---
+docs/**  linguist-documentation
+*.md     linguist-documentation
+
+# --- Terraform lock 檔：由工具產生，避免 merge 時的無意義衝突提示 ---
+.terraform.lock.hcl linguist-generated -diff

@@ -1,0 +1,177 @@
+# ==============================================================================
+# 守護對象：`services/dataplane/`（模組 C，Python + FastAPI 資料面）
+#
+# dataplane 是整個系統最敏感的元件：它握有 KMS 信封加密、PII 遮罩與假名化邏輯。
+# 這條 workflow 是「金融資安」賽道（Financial Cybersecurity）的品質閘門，負責證明：
+#   1. 程式碼風格與格式一致（ruff check / ruff format --check）
+#   2. 型別註記正確（mypy）——加解密與遮罩路徑最怕型別誤用導致明文外洩
+#   3. 測試通過且覆蓋率達門檻（pytest --cov-fail-under）
+#   4. Python 相依沒有已知弱點（pip-audit 比對 PyPI advisory 資料庫）
+#   5. 容器映像沒有 HIGH/CRITICAL 弱點（Trivy，exit-code 1 直接阻擋）並上傳 SARIF
+#
+# 對應 CCSP Domain 2（資料安全）與 Domain 4（應用程式安全）。
+# ==============================================================================
+name: dataplane-py
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/dataplane/**'
+      - '.github/workflows/dataplane-py.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/dataplane/**'
+      - '.github/workflows/dataplane-py.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 依 docs/CONTRACT.md 第 1 節，容器內 Python 版本為 3.12，CI 與容器保持一致。
+  PYTHON_VERSION: '3.12'
+  DATAPLANE_DIR: services/dataplane
+  # 與 Makefile 的 DATAPLANE_IMAGE 預設值一致（docs/CONTRACT.md 第 2 節）。
+  DATAPLANE_IMAGE: aegis/dataplane:dev
+  # 測試覆蓋率下限。dataplane 涉及加密與遮罩，門檻刻意訂得比一般服務高；
+  # 若要調整請連同 docs 一起說明理由，不要默默降低。
+  COVERAGE_MIN: '80'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 靜態檢查 + 型別檢查 + 測試 + 相依弱點掃描
+  # ---------------------------------------------------------------------------
+  lint-test:
+    name: ruff / mypy / pytest / pip-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # astral-sh/setup-uv v10.1.0：官方 uv 安裝 action。
+      # enable-cache 會快取 uv 的 wheel 下載，cache-dependency-glob 綁定 uv.lock，
+      # 依賴變動時才重新解析，這是 uv 專案在 CI 上最省時的設定。
+      - name: 安裝 uv（含相依快取）
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'services/dataplane/uv.lock'
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # --frozen 要求 uv.lock 必須與 pyproject.toml 同步；
+      # 若有人改了依賴卻沒更新 lock，這一步就會失敗（可重現建置的基本要求）。
+      - name: 安裝相依（uv sync --frozen）
+        working-directory: services/dataplane
+        run: uv sync --frozen --all-extras --dev
+
+      - name: ruff check（靜態檢查）
+        working-directory: services/dataplane
+        run: uv run ruff check app tests
+
+      - name: ruff format --check（格式檢查）
+        working-directory: services/dataplane
+        run: uv run ruff format --check app tests
+
+      # mypy 針對 app 套件；KeyProvider / 遮罩策略等抽象介面靠型別檢查守住實作一致性。
+      - name: mypy（型別檢查）
+        working-directory: services/dataplane
+        run: uv run mypy app
+
+      # 等價於 Makefile 的 test-dataplane，額外加上覆蓋率下限作為阻擋條件。
+      - name: pytest（含覆蓋率門檻）
+        working-directory: services/dataplane
+        run: |
+          set -euo pipefail
+          uv run pytest -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under="${COVERAGE_MIN}"
+
+      - name: 上傳覆蓋率 artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dataplane-coverage
+          path: services/dataplane/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      # pip-audit 是 PyPA 官方的相依弱點掃描工具，等同 Go 的 govulncheck。
+      # 做法：先用 uv export 把 lock 展開成 requirements 格式（掃「實際會安裝的版本」，
+      # 而不是 pyproject 裡的寬鬆版本範圍），再交給 pip-audit 比對 advisory 資料庫。
+      # --no-emit-project 排除本專案自身（它不在 PyPI 上，會造成解析失敗）。
+      - name: 匯出鎖定後的相依清單
+        working-directory: services/dataplane
+        run: |
+          set -euo pipefail
+          uv export \
+            --frozen \
+            --no-hashes \
+            --no-emit-project \
+            --format requirements-txt \
+            --output-file requirements-ci.txt
+          echo "共 $(grep -cve '^\s*#' -e '^\s*$' requirements-ci.txt) 筆相依待掃描"
+
+      - name: 相依弱點掃描（pip-audit）
+        working-directory: services/dataplane
+        # 釘住 pip-audit 2.10.1；--strict 讓「無法解析的相依」也視為失敗，
+        # 避免掃描默默跳過某些套件卻回報成功。
+        run: uvx pip-audit@2.10.1 --requirement requirements-ci.txt --strict --progress-spinner off
+
+  # ---------------------------------------------------------------------------
+  # 容器映像建置 + Trivy 掃描（阻擋 + SARIF）
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: 建置映像 + Trivy 掃描
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      # 唯一提權原因：上傳 Trivy 的 SARIF 報告到 Code Scanning。
+      security-events: write
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7
+
+      # 與 Makefile `images` 目標的 dataplane 部分等價（同一個映像標籤）。
+      - name: 建置 dataplane 容器映像
+        run: docker build -t "${DATAPLANE_IMAGE}" "${DATAPLANE_DIR}"
+
+      - name: Trivy 掃描映像（產出 SARIF）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.DATAPLANE_IMAGE }}
+          format: sarif
+          output: trivy-dataplane.sarif
+          severity: 'HIGH,CRITICAL'
+          limit-severities-for-sarif: true
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: 上傳 Trivy SARIF 到 Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-dataplane.sarif
+          category: trivy-image-dataplane
+
+      # 真正的阻擋閘門，判準與 Makefile `scan-images` 一致。
+      - name: Trivy 阻擋閘門（HIGH/CRITICAL 即失敗）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.DATAPLANE_IMAGE }}
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'

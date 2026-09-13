@@ -1,0 +1,75 @@
+# Aegis-Enclave 模組 A：碳權合約 Foundry 設定
+# Solidity 版本鎖定 0.8.28（依 docs/CONTRACT.md 第 1 節），不可擅自升版。
+
+[profile.default]
+# --- 路徑（全部明確指定，避免不同 forge 版本預設值漂移）---
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+cache_path = "cache"
+broadcast = "broadcast"
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+]
+
+# --- 編譯器 ---
+solc = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+# 位元碼不嵌入 metadata 雜湊，讓 CI 產出可重現（deterministic build）
+bytecode_hash = "none"
+cbor_metadata = false
+# 警告視為錯誤：避免「未使用變數 / 遮蔽宣告」之類的缺陷被忽略
+deny_warnings = true
+
+# --- 測試 ---
+verbosity = 2
+gas_reports = ["CarbonCredit", "RetirementRegistry"]
+# 允許測試與腳本讀寫部署產出檔（vm.writeJson 需要授權）
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
+[profile.default.fuzz]
+runs = 512
+max_test_rejects = 1_000_000
+
+[profile.default.invariant]
+runs = 256
+depth = 64
+# handler 已把所有輸入 bound 在合法區間，因此任何 revert 都代表缺陷，必須讓測試失敗
+fail_on_revert = true
+call_override = false
+shrink_run_limit = 5000
+
+# --- CI profile：加大模糊測試強度（FOUNDRY_PROFILE=ci forge test）---
+[profile.ci]
+verbosity = 3
+
+[profile.ci.fuzz]
+runs = 10_000
+max_test_rejects = 2_000_000
+
+[profile.ci.invariant]
+runs = 1024
+depth = 128
+fail_on_revert = true
+shrink_run_limit = 10_000
+
+# --- 覆蓋率 profile：關閉 optimizer 以取得精準的行對應 ---
+[profile.coverage]
+optimizer = false
+via_ir = false
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"
+multiline_func_header = "attributes_first"
+sort_imports = true

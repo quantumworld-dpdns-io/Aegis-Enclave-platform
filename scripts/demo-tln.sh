@@ -65,7 +65,7 @@ demo::scene "攻擊一：沒有用戶端憑證" \
 demo::run "curl -sS --cacert '${CA}' '${RECORDS}/demo-0001'"
 demo::assert_fail "無用戶端憑證的請求在 TLS 交握階段就被拒絕"
 demo::run "curl -sS ${BASE//https/http}/api/v1/vault/records 2>&1 | head -3"
-demo::narrate "順手證明明文 HTTP 也進不來：閘道只聽 TLS。"
+demo::assert_fail "改用明文 HTTP 也連不進來：閘道只聽 TLS，沒有降級的空間"
 demo::pause
 
 # ---------------------------------------------------------------------------

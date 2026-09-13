@@ -1,0 +1,197 @@
+# 資料面（Python + FastAPI）— 持有金鑰與明文的高價值目標
+#
+# 威脅模型：這是整個系統中唯一能解密客戶資料、唯一握有 KMS 呼叫權限的元件。
+# 因此它被設計成「除了閘道以外沒有任何人能連進來，除了三個後端以外哪裡都去不了」：
+#   - 進向：只有帶 app.kubernetes.io/name=gateway 標籤的 Pod，且只能走 L7 白名單上的四條路徑
+#           （見 infra/k8s/policies/03-gateway-to-dataplane-l7.yaml）。
+#   - 出向：只有 localstack:4566 / vault:8200 / anvil:8545
+#           （見 infra/k8s/policies/04-dataplane-egress.yaml），對應資料外洩防護。
+# 容器邊界的強化項目與 gateway.yaml 相同，該檔標頭有逐項說明對應的攻擊手法。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dataplane-sa
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: dataplane
+    app.kubernetes.io/part-of: aegis-enclave
+# 資料面同樣不需要 Kubernetes API，不掛載 token 以切斷橫向移動路徑。
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aegis-chain
+  namespace: aegis
+  labels:
+    app.kubernetes.io/part-of: aegis-enclave
+data:
+  # 碳權合約位址在合約部署完成後才知道（模組 A 寫入 contracts/deployments/local.json）。
+  # 這裡先留空佔位，部署腳本以下列指令回填，再滾動重啟資料面：
+  #   kubectl -n aegis patch configmap aegis-chain --type merge \
+  #     -p '{"data":{"carbon-contract-address":"0x..."}}'
+  #   kubectl -n aegis rollout restart deploy/dataplane
+  carbon-contract-address: ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataplane
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: dataplane
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  type: ClusterIP
+  # 與 gateway Service 相同的理由：多帶 component=server，
+  # 避免攻擊模擬用的同標籤探針 Pod 被誤加進 endpoints。
+  selector:
+    app.kubernetes.io/name: dataplane
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataplane
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: dataplane
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: aegis-enclave
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dataplane
+      app.kubernetes.io/component: server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dataplane
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: aegis-enclave
+    spec:
+      serviceAccountName: dataplane-sa
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dataplane
+          image: aegis/dataplane:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # 以下變數對應 docs/CONTRACT.md 第 5 節。
+            - name: AEGIS_KMS_DRIVER
+              value: "localstack"
+            - name: AEGIS_KMS_KEY_ID
+              value: "alias/aegis-master"
+            - name: AEGIS_KMS_ENDPOINT
+              value: "http://localstack.aegis.svc.cluster.local:4566"
+            - name: AEGIS_VAULT_ADDR
+              value: "http://vault.aegis.svc.cluster.local:8200"
+            # Vault token 一律從 Secret 掛入，絕不寫死在清單裡。
+            # optional: true 讓預設的 localstack driver 不需要這個 Secret 也能啟動；
+            # 要改用 vault driver 時再依 secrets.example.yaml 建立。
+            - name: AEGIS_VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-dataplane-secrets
+                  key: vault-token
+                  optional: true
+            - name: AEGIS_VAULT_TRANSIT_KEY
+              value: "aegis-master"
+            - name: AWS_REGION
+              value: "ap-northeast-1"
+            # LocalStack 不驗證憑證，但 boto3 一定要拿得到 credential 才肯發請求，
+            # 因此給兩個公開週知的假值。這不是機密，真實 AWS 環境請改用 IRSA /
+            # Workload Identity，絕不要用靜態金鑰。
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            - name: AEGIS_PSEUDONYM_SALT_KEY_ID
+              value: "alias/aegis-pseudonym"
+            - name: AEGIS_CHAIN_RPC_URL
+              value: "http://anvil.aegis.svc.cluster.local:8545"
+            - name: AEGIS_CARBON_CONTRACT_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: aegis-chain
+                  key: carbon-contract-address
+                  optional: true
+            - name: AEGIS_LOG_LEVEL
+              value: "info"
+            # 根檔案系統唯讀後，把所有暫存寫入導到記憶體型 emptyDir，
+            # 避免 Python 套件（matplotlib/fontconfig 等）在啟動時寫家目錄失敗。
+            - name: HOME
+              value: "/tmp"
+            - name: TMPDIR
+              value: "/tmp"
+          # 契約第 2 節只為資料面定義了 /internal/healthz，
+          # 所以存活與就緒都用這條路徑（kubelet 的探針流量已在策略中明確放行）。
+          livenessProbe:
+            httpGet:
+              path: /internal/healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /internal/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10002
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

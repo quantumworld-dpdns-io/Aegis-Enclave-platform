@@ -67,8 +67,10 @@ AEGIS_CLUSTER_NAME="${AEGIS_CLUSTER_NAME:-aegis-enclave}"
 AEGIS_GATEWAY_PORT="${AEGIS_GATEWAY_PORT:-8080}"
 AEGIS_GATEWAY_METRICS_PORT="${AEGIS_GATEWAY_METRICS_PORT:-9090}"
 AEGIS_DEMO_BASE_URL="${AEGIS_DEMO_BASE_URL:-https://127.0.0.1:${AEGIS_GATEWAY_PORT}}"
-# demo 用的用戶端憑證與 JWT。實際產生者見 docs/demo/README.md 的「介面缺口」一節。
-AEGIS_DEMO_ASSET_DIR="${AEGIS_DEMO_ASSET_DIR:-${DEMO_REPO_ROOT}/.demo}"
+# demo 用的用戶端憑證與 JWT。實際產生者見 docs/demo/README.md 的「demo 素材」一節。
+# 預設刻意用相對路徑：所有 demo 腳本開場都會 cd 到 repo 根目錄，
+# 這樣印在螢幕上的指令是短的、可以直接複製貼上的，不會被一長串絕對路徑淹沒。
+AEGIS_DEMO_ASSET_DIR="${AEGIS_DEMO_ASSET_DIR:-.demo}"
 AEGIS_DEMO_PKI_DIR="${AEGIS_DEMO_PKI_DIR:-${AEGIS_DEMO_ASSET_DIR}/pki}"
 AEGIS_DEMO_TOKEN_DIR="${AEGIS_DEMO_TOKEN_DIR:-${AEGIS_DEMO_ASSET_DIR}/tokens}"
 
@@ -213,23 +215,23 @@ demo::require_cluster() {
     printf '%s\n' "  ${C_DIM}略過${C_RESET}  叢集檢查（--dry-run）"
     return 0
   fi
-  command -v kubectl >/dev/null 2>&1 || {
+  if ! demo::have kubectl; then
     demo::blocker "kubectl 未安裝，無法連接叢集" "執行 make bootstrap"
     demo::degrade
-    return 1
-  }
+    return 0
+  fi
   if ! kubectl cluster-info >/dev/null 2>&1; then
     demo::blocker \
       "連不上 Kubernetes 叢集（KUBECONFIG=${KUBECONFIG:-未設定}）" \
       "執行 make up 建立 ${AEGIS_CLUSTER_NAME} 叢集；或先 make doctor 確認環境"
     demo::degrade
-    return 1
+    return 0
   fi
   printf '%s\n' "  ${C_GREEN}OK${C_RESET}    叢集可連線"
   if ! kubectl get ns "$AEGIS_NAMESPACE" >/dev/null 2>&1; then
     demo::blocker "命名空間 ${AEGIS_NAMESPACE} 不存在" "執行 make deploy"
     demo::degrade
-    return 1
+    return 0
   fi
   printf '%s\n' "  ${C_GREEN}OK${C_RESET}    命名空間 ${AEGIS_NAMESPACE}"
   return 0
@@ -251,7 +253,7 @@ demo::require_deploy() {
   demo::blocker "${ns}/${deploy} 尚未就緒" \
     "執行 make deploy，或 kubectl -n ${ns} describe deploy/${deploy} 看事件"
   demo::degrade
-  return 1
+  return 0
 }
 
 demo::preflight_header() {
@@ -446,6 +448,8 @@ demo::port_forward() {
 demo::header() {
   DEMO_NAME="$1"; DEMO_DATE="$2"; DEMO_TAGLINE="$3"
   trap demo::_cleanup EXIT
+  # 統一工作目錄，讓所有相對路徑（.demo/、contracts/、infra/）不論從哪裡呼叫都一致。
+  cd "$DEMO_REPO_ROOT"
   printf '\n%s\n' "${C_CYAN}${DEMO_RULE}${C_RESET}"
   printf '%s\n' "${C_BOLD}  Aegis-Enclave 展示　—　${DEMO_NAME}${C_RESET}"
   printf '%s\n' "  ${C_DIM}${DEMO_DATE}${C_RESET}"
