@@ -177,7 +177,7 @@ jobs:
       - name: 上傳 SARIF 到 Code Scanning
         # if: always() 確保即使 Slither 本身異常中斷，已產生的部分結果仍會上傳。
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
           category: slither-contracts

@@ -160,7 +160,7 @@ jobs:
 
       - name: 上傳 Trivy SARIF 到 Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-dataplane.sarif
           category: trivy-image-dataplane
