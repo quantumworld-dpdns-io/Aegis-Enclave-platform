@@ -60,7 +60,7 @@ jobs:
       # enable-cache 會快取 uv 的 wheel 下載，cache-dependency-glob 綁定 uv.lock，
       # 依賴變動時才重新解析，這是 uv 專案在 CI 上最省時的設定。
       - name: 安裝 uv（含相依快取）
-        uses: astral-sh/setup-uv@v10.1.0
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: 'services/dataplane/uv.lock'
