@@ -107,7 +107,7 @@ jobs:
 
       - name: 上傳 Terraform SARIF 到 Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-terraform.sarif
           category: trivy-config-terraform
@@ -125,7 +125,7 @@ jobs:
 
       - name: 上傳 Kubernetes SARIF 到 Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-k8s.sarif
           category: trivy-config-k8s
