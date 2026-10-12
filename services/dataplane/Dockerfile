@@ -1,6 +1,6 @@
 # 多階段建置：最終映像不含編譯器與 lock 以外的開發工具，並以非 root 執行。
 # 容器內 Python 固定 3.12，對齊 docs/CONTRACT.md 第 1 節。
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.8.15 /uv /usr/local/bin/uv
 WORKDIR /app
@@ -13,7 +13,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
 
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # 10002 對齊 infra/k8s/base/dataplane.yaml 的 runAsUser。
 RUN groupadd --gid 10002 aegis \
