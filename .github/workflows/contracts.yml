@@ -59,7 +59,7 @@ jobs:
       # foundry-rs/foundry-toolchain 是 Foundry 官方 action；v1.9.1 為目前最新 patch，
       # 固定 patch 版本可避免上游變更 forge 預設行為時 CI 突然改變結果。
       - name: 安裝 Foundry 工具鏈
-        uses: foundry-rs/foundry-toolchain@v1.9.1
+        uses: foundry-rs/foundry-toolchain@v1.9.2
         with:
           # 使用 stable 通道而非 nightly，確保 forge coverage / forge inspect 行為穩定。
           version: stable
@@ -144,7 +144,7 @@ jobs:
           submodules: recursive
 
       - name: 安裝 Foundry 工具鏈
-        uses: foundry-rs/foundry-toolchain@v1.9.1
+        uses: foundry-rs/foundry-toolchain@v1.9.2
         with:
           version: stable
           cache: true
@@ -198,7 +198,7 @@ jobs:
           submodules: recursive
 
       - name: 安裝 Foundry 工具鏈
-        uses: foundry-rs/foundry-toolchain@v1.9.1
+        uses: foundry-rs/foundry-toolchain@v1.9.2
         with:
           version: stable
           cache: true
